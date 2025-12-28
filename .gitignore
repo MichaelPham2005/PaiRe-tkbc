@@ -1,0 +1,8 @@
+build
+*.egg-info
+**/__pycache__
+dist
+**/.nfs*
+tkbc/data/
+tkbc/src_data/
+tkbc/models/

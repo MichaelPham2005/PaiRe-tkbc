@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 # Sanity Check Script for ContinuousPairRE before training
-# Kiểm tra các điểm quan trọng trước khi bắt đầu train
 
 import os
 import torch
@@ -14,7 +13,7 @@ def sanity_check():
     print("="*70)
     
     # 1. Check W and b dimensions in ContinuousTimeEmbedding
-    print("\n1. Kiểm tra kích thước W và b trong ContinuousTimeEmbedding:")
+    print("\n1. Check W and b dimensions in ContinuousTimeEmbedding:")
     rank = 100
     dataset = TemporalDataset('ICEWS14', use_continuous_time=True)
     sizes = dataset.get_shape()
@@ -26,14 +25,14 @@ def sanity_check():
     print(f"   ✓ b shape: {b_shape} (Expected: torch.Size([{rank}]))")
     
     if W_shape == torch.Size([rank]) and b_shape == torch.Size([rank]):
-        print("   ✓ PASS: W và b đều là vector có chiều bằng rank")
-        print("   → Mô hình có thể học các chu kỳ khác nhau trên từng chiều")
+        print("   ✓ PASS: W and b are vectors with dimension = rank")
+        print("   → Model can learn different cycles per dimension")
     else:
-        print("   ✗ FAIL: W hoặc b không có kích thước đúng!")
+        print("   ✗ FAIL: W or b have incorrect dimensions!")
         return False
     
     # 2. Check data paths and files
-    print("\n2. Kiểm tra đường dẫn dữ liệu và files:")
+    print("\n2. Check data paths and files:")
     data_path = Path(__file__).resolve().parent / "data" / "ICEWS14"
     
     required_files = [
@@ -54,14 +53,14 @@ def sanity_check():
             all_exist = False
     
     if all_exist:
-        print("   ✓ PASS: Tất cả files cần thiết đều tồn tại")
+        print("   ✓ PASS: All required files exist")
     else:
-        print("   ✗ FAIL: Thiếu một số files quan trọng!")
-        print("   → Hãy chạy preprocess_continuous_time.py trước")
+        print("   ✗ FAIL: Missing required files!")
+        print("   → Run preprocess_continuous_time.py first")
         return False
     
     # 3. Check alpha initialization
-    print("\n3. Kiểm tra khởi tạo tham số alpha:")
+    print("\n3. Check alpha initialization:")
     with torch.no_grad():
         alphas = torch.sigmoid(model.alpha.weight).cpu()
     
@@ -74,9 +73,9 @@ def sanity_check():
     
     # Check if alphas are reasonable (not all 0 or all 1)
     if 0.3 < alphas.mean().item() < 0.7:
-        print("   ✓ PASS: Alpha được khởi tạo ở giá trị trung bình hợp lý (0.5)")
+        print("   ✓ PASS: Alpha initialized at reasonable mean (0.5)")
     else:
-        print("   ⚠ WARNING: Alpha mean không ở khoảng 0.3-0.7")
+        print("   ⚠ WARNING: Alpha mean not in range 0.3-0.7")
     
     # 4. Test forward pass with continuous time
     print("\n4. Test forward pass với continuous time:")
@@ -101,13 +100,13 @@ def sanity_check():
         print(f"   ✓ Scores shape: {scores.shape}")
         print(f"   ✓ Factors shapes: {[f.shape for f in factors]}")
         print(f"   ✓ Time embeddings shape: {time_embeds.shape}")
-        print("   ✓ PASS: Forward pass hoạt động bình thường")
+        print("   ✓ PASS: Forward pass working correctly")
     except Exception as e:
-        print(f"   ✗ FAIL: Forward pass gặp lỗi: {e}")
+        print(f"   ✗ FAIL: Forward pass error: {e}")
         return False
     
     # 5. Check optimizer configuration
-    print("\n5. Kiểm tra optimizer configuration:")
+    print("\n5. Check optimizer configuration:")
     from torch import optim
     from regularizers import N3, ContinuousTimeLambda3
     
@@ -118,10 +117,10 @@ def sanity_check():
     print(f"   ✓ Optimizer: Adagrad (learning rate: 0.1)")
     print(f"   ✓ Embedding regularizer: N3 (weight: 0.001)")
     print(f"   ✓ Time regularizer: ContinuousTimeLambda3 (weight: 0.001)")
-    print("   ✓ PASS: Optimizer và regularizers được cấu hình đúng")
+    print("   ✓ PASS: Optimizer and regularizers configured correctly")
     
     # 6. Check model parameters
-    print("\n6. Kiểm tra model parameters:")
+    print("\n6. Check model parameters:")
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     
@@ -146,22 +145,22 @@ def sanity_check():
     
     # 7. Final recommendations
     print("\n" + "="*70)
-    print("KHUYẾN NGHỊ TRƯỚC KHI TRAIN:")
+    print("RECOMMENDATIONS BEFORE TRAINING:")
     print("="*70)
-    print("\n✓ Tất cả kiểm tra đã PASS!")
-    print("\n📝 Lưu ý khi training:")
-    print("   1. Theo dõi alpha statistics mỗi epoch")
-    print("   2. Nếu alpha hội tụ quá nhanh về 0 hoặc 1:")
-    print("      → Giảm learning rate hoặc thêm regularization cho alpha")
-    print("   3. Nếu overfitting (train MRR >> valid MRR):")
-    print("      → Tăng --emb_reg và --time_reg (thử 0.01, 0.1)")
-    print("   4. Nếu underfitting (train và valid MRR đều thấp):")
-    print("      → Tăng rank hoặc giảm regularization")
+    print("\n✓ All checks PASSED!")
+    print("\n📝 Training tips:")
+    print("   1. Monitor alpha statistics each epoch")
+    print("   2. If alpha converges too fast to 0 or 1:")
+    print("      → Reduce learning rate or add alpha regularization")
+    print("   3. If overfitting (train MRR >> valid MRR):")
+    print("      → Increase --emb_reg and --time_reg (try 0.01, 0.1)")
+    print("   4. If underfitting (both train and valid MRR are low):")
+    print("      → Increase rank or reduce regularization")
     print("   5. Monitor loss components:")
     print("      → loss: prediction loss")
     print("      → reg: embedding regularization")
     print("      → cont: time regularization")
-    print("\n🚀 Sẵn sàng train! Chạy lệnh:")
+    print("\n🚀 Ready to train! Run:")
     print("   .\\train_continuous_pairre.ps1")
     print("="*70)
     

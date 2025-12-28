@@ -37,25 +37,15 @@ class Lambda3(Regularizer):
 
 
 class ContinuousTimeLambda3(Regularizer):
-    """
-    Regularizer for continuous time embeddings.
-    Applies N3 regularization to time embeddings to prevent overfitting.
-    """
+    """L3 regularization for continuous time embeddings."""
     def __init__(self, weight: float):
         super(ContinuousTimeLambda3, self).__init__()
         self.weight = weight
 
     def forward(self, factor):
-        """
-        Args:
-            factor: Time embeddings of shape (batch, rank)
-        Returns:
-            Regularization loss (scalar)
-        """
+        """Apply L3 norm to time embeddings."""
         if factor is None:
             return torch.tensor(0.0)
         
-        # Apply L3 norm (cubic norm) to time embeddings
-        # Similar to N3 regularizer but specifically for time
         norm = self.weight * torch.sum(torch.abs(factor) ** 3)
         return norm / factor.shape[0]

@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 # Visualize Alpha Weights from trained ContinuousPairRE model
-# Trực quan hóa trọng số alpha từ model đã train
 
 import os
 import torch

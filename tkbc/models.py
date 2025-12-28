@@ -32,15 +32,7 @@ class TKBCModel(nn.Module, ABC):
             batch_size: int = 1000, chunk_size: int = -1,
             timestamp_ids: torch.Tensor = None
     ):
-        """
-        Returns filtered ranking for each queries.
-        :param queries: a torch.LongTensor of quadruples (lhs, rel, rhs, timestamp)
-        :param filters: filters[(lhs, rel, ts)] gives the elements to filter from ranking
-        :param batch_size: maximum number of queries processed at once
-        :param chunk_size: maximum number of candidates processed at once
-        :param timestamp_ids: original discrete timestamp IDs (for continuous time models)
-        :return:
-        """
+        """Returns filtered ranking for queries."""
         if chunk_size < 0:
             chunk_size = self.sizes[2]
         ranks = torch.ones(len(queries))
@@ -54,7 +46,8 @@ class TKBCModel(nn.Module, ABC):
                     q = self.get_queries(these_queries)
 
                     scores = q @ rhs
-                    targets = self.score(these_queries)
+                    targets = self.score(these_queries)  # (batch,)
+                    targets = targets.unsqueeze(1)  # (batch, 1) for broadcasting
                     assert not torch.any(torch.isinf(scores)), "inf scores"
                     assert not torch.any(torch.isnan(scores)), "nan scores"
                     assert not torch.any(torch.isinf(targets)), "inf targets"
@@ -471,45 +464,20 @@ class TNTComplEx(TKBCModel):
 
 
 class ContinuousTimeEmbedding(nn.Module):
-    """
-    Continuous time embedding using learnable cosine-based regression.
-    
-    Implements: m = cos(W * tau + b)
-    where tau is the normalized continuous timestamp.
-    """
+    """Continuous time embedding: m = cos(W*t + b)"""
     def __init__(self, dim: int):
         super(ContinuousTimeEmbedding, self).__init__()
         self.dim = dim
-        # Learnable parameters for continuous time embedding
         self.W = nn.Parameter(torch.randn(dim) * 0.01)
         self.b = nn.Parameter(torch.zeros(dim))
     
     def forward(self, t: torch.Tensor):
-        """
-        Args:
-            t: Normalized continuous timestamps of shape (batch_size,)
-        Returns:
-            Time embeddings of shape (batch_size, dim)
-        """
-        # Expand t to (batch_size, dim) and compute cos(W * t + b)
         return torch.cos(t.unsqueeze(-1) * self.W + self.b)
 
 
 class ContinuousPairRE(TKBCModel):
-    """
-    Continuous-time PairRE model with relation-wise temporal gating.
-    
-    Scoring function: ||( (h * r^H - t * r^T) * (alpha * m + (1-alpha) * 1) )||
-    where:
-        - h, t: head and tail entity embeddings
-        - r^H, r^T: relation-specific projection vectors (PairRE style)
-        - m: continuous time embedding
-        - alpha: relation-specific temporal gating coefficient
-    """
-    def __init__(
-            self, sizes: Tuple[int, int, int, int], rank: int,
-            init_size: float = 1e-3
-    ):
+    """Continuous-time PairRE with relation-wise temporal gating"""
+    def __init__(self, sizes: Tuple[int, int, int, int], rank: int, init_size: float = 1e-3):
         super(ContinuousPairRE, self).__init__()
         self.sizes = sizes
         self.rank = rank
@@ -537,50 +505,21 @@ class ContinuousPairRE(TKBCModel):
         return True
     
     def score(self, x: torch.Tensor):
-        """
-        Compute scores for given quadruples.
+        h = self.entity_embeddings(x[:, 0].long())
+        r_h = self.relation_head(x[:, 1].long())
+        t = self.entity_embeddings(x[:, 2].long())
+        r_t = self.relation_tail(x[:, 1].long())
         
-        Args:
-            x: Tensor of shape (batch_size, 4) containing [head, relation, tail, time]
-               where time is a normalized continuous value
-        Returns:
-            Scores of shape (batch_size, 1)
-        """
-        # Extract components - convert first 3 columns to long for embedding lookup
-        h = self.entity_embeddings(x[:, 0].long())  # (batch, rank)
-        r_h = self.relation_head(x[:, 1].long())     # (batch, rank)
-        t = self.entity_embeddings(x[:, 2].long())   # (batch, rank)
-        r_t = self.relation_tail(x[:, 1].long())     # (batch, rank)
+        time_continuous = x[:, 3].float()
+        m = self.time_encoder(time_continuous)
+        alpha = torch.sigmoid(self.alpha(x[:, 1].long()))
+        gate = alpha * m + (1 - alpha)
         
-        # Get continuous time embedding (keep as float)
-        time_continuous = x[:, 3].float()     # (batch,)
-        m = self.time_encoder(time_continuous) # (batch, rank)
-        
-        # Get relation-specific gating coefficient
-        alpha = torch.sigmoid(self.alpha(x[:, 1].long()))  # (batch, 1)
-        
-        # Compute gated time modulation: alpha * m + (1 - alpha) * 1
-        gate = alpha * m + (1 - alpha)  # (batch, rank)
-        
-        # PairRE interaction with temporal gating
-        interaction = (h * r_h - t * r_t) * gate  # (batch, rank)
-        
-        # Score is negative L1 norm (higher score = better)
-        score = -torch.abs(interaction).sum(dim=-1, keepdim=True)
-        
+        interaction = (h * r_h - t * r_t) * gate
+        score = -torch.abs(interaction).sum(dim=-1)
         return score
     
     def forward(self, x: torch.Tensor):
-        """
-        Forward pass for training.
-        
-        Args:
-            x: Tensor of shape (batch_size, 4) containing [head, relation, tail, time]
-        Returns:
-            - scores: (batch, n_entities) scoring all possible tails
-            - factors: tuple of regularization factors
-            - time_embedding: for compatibility
-        """
         batch_size = x.shape[0]
         
         # Extract components
@@ -615,23 +554,48 @@ class ContinuousPairRE(TKBCModel):
             score = -torch.abs(interaction).sum(dim=1)  # (n_entities,)
             scores.append(score)
         
-        scores = torch.stack(scores)  # (batch, n_entities)
+        scores = torch.stack(scores)
+        t = self.entity_embeddings(x[:, 2].long())
         
-        # Get tail embeddings for regularization
-        t = self.entity_embeddings(x[:, 2].long())  # (batch, rank)
-        
-        # Return regularization factors as individual tensors (not aggregated)
-        # This allows N3 regularizer to compute proper cubic norm
-        # Factors: (lhs, rel, rhs) where rel combines r_h and r_t
         factors = (
-            torch.sqrt(h ** 2 + 1e-10),      # (batch, rank) - head entities
-            torch.sqrt(r_h ** 2 + r_t ** 2 + 1e-10),  # (batch, rank) - relations
-            torch.sqrt(t ** 2 + 1e-10)       # (batch, rank) - tail entities
+            torch.sqrt(h ** 2 + 1e-10),
+            torch.sqrt(r_h ** 2 + r_t ** 2 + 1e-10),
+            torch.sqrt(t ** 2 + 1e-10)
         )
-        
-        # Return time embeddings for temporal regularization (Lambda3)
-        # m is the continuous time embedding: (batch, rank)
         return scores, factors, m
+    
+    def get_ranking(self, queries: torch.Tensor, filters: Dict[Tuple[int, int, int], List[int]],
+                    batch_size: int = 1000, chunk_size: int = -1, timestamp_ids: torch.Tensor = None):
+        ranks = torch.ones(len(queries))
+        with torch.no_grad():
+            b_begin = 0
+            while b_begin < len(queries):
+                these_queries = queries[b_begin:b_begin + batch_size]
+                all_scores, _, _ = self.forward(these_queries)
+                targets = self.score(these_queries).unsqueeze(1)
+                
+                for i, query in enumerate(these_queries):
+                    if timestamp_ids is not None:
+                        ts_for_filter = int(timestamp_ids[b_begin + i].item())
+                    else:
+                        ts_for_filter = int(query[3].item())
+                    
+                    # Get entities to filter (but DON'T include target - it's added below)
+                    filter_out = filters[(int(query[0].item()), int(query[1].item()), ts_for_filter)]
+                    # Filter out known true entities (except the target we're testing)
+                    target_idx = int(queries[b_begin + i, 2].item())
+                    filter_out = [x for x in filter_out if x != target_idx]
+                    if len(filter_out) > 0:
+                        all_scores[i, torch.LongTensor(filter_out)] = -1e6
+                
+                # Compute ranks
+                ranks[b_begin:b_begin + batch_size] = torch.sum(
+                    (all_scores >= targets).float(), dim=1
+                ).cpu()
+                
+                b_begin += batch_size
+        
+        return ranks
     
     def forward_over_time(self, x: torch.Tensor):
         """
@@ -647,35 +611,21 @@ class ContinuousPairRE(TKBCModel):
         raise NotImplementedError("forward_over_time requires normalized timestamp array")
     
     def get_rhs(self, chunk_begin: int, chunk_size: int):
-        """Get right-hand side entities for ranking."""
+        """Get entity embeddings for ranking."""
         return self.entity_embeddings.weight.data[
             chunk_begin:chunk_begin + chunk_size
         ].transpose(0, 1)
     
     def get_queries(self, queries: torch.Tensor):
-        """
-        Compute query embeddings for ranking.
-        
-        Args:
-            queries: (batch, 4) tensor [head, relation, tail, time]
-        Returns:
-            Query embeddings for scoring against all entities
-        """
+        """Compute query embeddings (left side of PairRE interaction)."""
         h = self.entity_embeddings(queries[:, 0].long())
         r_h = self.relation_head(queries[:, 1].long())
-        r_t = self.relation_tail(queries[:, 1].long())
         
-        # Get continuous time embedding
         time_continuous = queries[:, 3].float()
         m = self.time_encoder(time_continuous)
         
-        # Get gating
         alpha = torch.sigmoid(self.alpha(queries[:, 1].long()))
         gate = alpha * m + (1 - alpha)
         
-        # For ranking, we need to return query that will be compared with all entities
-        # This is simplified - may need adjustment based on exact ranking protocol
-        query = (h * r_h) * gate
-        
-        return query
+        return h * r_h * gate
 

@@ -255,9 +255,7 @@ for epoch in range(args.max_epochs):
         
         print(f"{'='*70}\n")
 
-# ============================================================================
-# FINAL TEST EVALUATION (Only run once with best model)
-# ============================================================================
+# Final test evaluation with best model
 print("\n" + "="*70)
 print("TRAINING COMPLETED - FINAL TEST EVALUATION")
 print("="*70)

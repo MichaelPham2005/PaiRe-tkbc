@@ -127,10 +127,7 @@ class IKBCOptimizer(object):
 
 
 class ContinuousTimeOptimizer(object):
-    """
-    Optimizer for models using continuous time representations.
-    Converts discrete timestamp IDs to continuous normalized values.
-    """
+    """Optimizer for continuous time models."""
     def __init__(
             self, model: TKBCModel,
             emb_regularizer: Regularizer, temporal_regularizer: Regularizer,

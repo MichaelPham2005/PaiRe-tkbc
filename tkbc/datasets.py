@@ -84,14 +84,7 @@ class TemporalDataset(object):
         # add special beginning = end = no_timestamp, increase n_timestamps by one.
     
     def get_continuous_time(self, timestamp_id):
-        """
-        Convert timestamp ID to normalized continuous time value.
-        
-        Args:
-            timestamp_id: Integer timestamp ID or tensor of IDs
-        Returns:
-            Normalized continuous time value(s) in [0, 100]
-        """
+        """Convert timestamp ID to normalized continuous time."""
         if self.ts_normalized is None:
             raise ValueError("Continuous time not loaded. Initialize with use_continuous_time=True")
         

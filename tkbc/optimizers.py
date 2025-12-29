@@ -132,12 +132,14 @@ class ContinuousTimeOptimizer(object):
             self, model: TKBCModel,
             emb_regularizer: Regularizer, temporal_regularizer: Regularizer,
             optimizer: optim.Optimizer, dataset: TemporalDataset,
-            batch_size: int = 256, verbose: bool = True
+            batch_size: int = 256, verbose: bool = True,
+            smoothness_regularizer: Regularizer = None
     ):
         self.model = model
         self.dataset = dataset
         self.emb_regularizer = emb_regularizer
         self.temporal_regularizer = temporal_regularizer
+        self.smoothness_regularizer = smoothness_regularizer
         self.optimizer = optimizer
         self.batch_size = batch_size
         self.verbose = verbose
@@ -176,7 +178,15 @@ class ContinuousTimeOptimizer(object):
                 l_time = torch.zeros_like(l_reg)
                 if time is not None:
                     l_time = self.temporal_regularizer.forward(time)
-                l = l_fit + l_reg + l_time
+                
+                # Add smoothness regularization on W and b
+                l_smooth = torch.zeros_like(l_reg)
+                if self.smoothness_regularizer is not None and hasattr(self.model, 'time_encoder'):
+                    W = self.model.time_encoder.W
+                    b = self.model.time_encoder.b
+                    l_smooth = self.smoothness_regularizer.forward(W, b)
+                
+                l = l_fit + l_reg + l_time + l_smooth
 
                 self.optimizer.zero_grad()
                 l.backward()
@@ -186,5 +196,6 @@ class ContinuousTimeOptimizer(object):
                 bar.set_postfix(
                     loss=f'{l_fit.item():.0f}',
                     reg=f'{l_reg.item():.0f}',
-                    cont=f'{l_time.item():.0f}'
+                    cont=f'{l_time.item():.0f}',
+                    smooth=f'{l_smooth.item():.4f}'
                 )

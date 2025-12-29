@@ -12,7 +12,7 @@ from pathlib import Path
 from datasets import TemporalDataset
 from optimizers import TKBCOptimizer, IKBCOptimizer, ContinuousTimeOptimizer
 from models import ComplEx, TComplEx, TNTComplEx, ContinuousPairRE
-from regularizers import N3, Lambda3, ContinuousTimeLambda3
+from regularizers import N3, Lambda3, ContinuousTimeLambda3, ContinuitySmoothness
 
 parser = argparse.ArgumentParser(
     description="Temporal ComplEx"
@@ -55,6 +55,10 @@ parser.add_argument(
 parser.add_argument(
     '--time_reg', default=0., type=float,
     help="Timestamp regularizer strength"
+)
+parser.add_argument(
+    '--smoothness_reg', default=0., type=float,
+    help="Continuity smoothness regularizer for W and b (ContinuousPairRE only)"
 )
 parser.add_argument(
     '--no_time_emb', default=False, action="store_true",
@@ -109,6 +113,8 @@ print(f"Max epochs: {args.max_epochs}")
 print(f"Validation frequency: every {args.valid_freq} epochs")
 print(f"Embedding regularization (N3): {args.emb_reg}")
 print(f"Time regularization: {args.time_reg}")
+if args.model == 'ContinuousPairRE':
+    print(f"Smoothness regularization (W/b): {args.smoothness_reg}")
 print(f"Checkpoint directory: {checkpoint_dir}")
 print("="*70 + "\n")
 
@@ -117,6 +123,8 @@ opt = optim.Adagrad(model.parameters(), lr=args.learning_rate)
 emb_reg = N3(args.emb_reg)
 # Use ContinuousTimeLambda3 for ContinuousPairRE, Lambda3 for others
 time_reg = ContinuousTimeLambda3(args.time_reg) if args.model == 'ContinuousPairRE' else Lambda3(args.time_reg)
+# Add smoothness regularizer for continuous time models
+smoothness_reg = ContinuitySmoothness(args.smoothness_reg) if args.model == 'ContinuousPairRE' else None
 
 # Track best validation MRR for saving best model
 best_valid_mrr = 0.0
@@ -140,7 +148,8 @@ for epoch in range(args.max_epochs):
         # Use continuous time optimizer for ContinuousPairRE
         optimizer = ContinuousTimeOptimizer(
             model, emb_reg, time_reg, opt, dataset,
-            batch_size=args.batch_size
+            batch_size=args.batch_size,
+            smoothness_regularizer=smoothness_reg
         )
         optimizer.epoch(examples)
     else:

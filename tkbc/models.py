@@ -513,6 +513,7 @@ class ContinuousPairRE(TKBCModel):
         time_continuous = x[:, 3].float()
         m = self.time_encoder(time_continuous)
         alpha = torch.sigmoid(self.alpha(x[:, 1].long()))
+        alpha = (alpha >= 0.2).float()  # Threshold: <0.2 -> 0, else -> 1
         gate = alpha * m + (1 - alpha)
         
         interaction = (h * r_h - t * r_t) * gate
@@ -533,6 +534,7 @@ class ContinuousPairRE(TKBCModel):
         
         # Get relation-specific gating coefficient
         alpha = torch.sigmoid(self.alpha(x[:, 1].long()))
+        alpha = (alpha >= 0.2).float()  # Threshold: <0.2 -> 0, else -> 1
         
         # Compute gated time modulation
         gate = alpha * m + (1 - alpha)
@@ -551,7 +553,7 @@ class ContinuousPairRE(TKBCModel):
             
             # Broadcast computation
             interaction = (h_i * r_h_i - all_entities * r_t_i) * gate_i  # (n_entities, rank)
-            score = -torch.abs(interaction).sum(dim=1)  # (n_entities,)
+            score = -torch.abs(interaction ** 2).sum(dim=-1)  # (n_entities,)
             scores.append(score)
         
         scores = torch.stack(scores)
@@ -625,6 +627,7 @@ class ContinuousPairRE(TKBCModel):
         m = self.time_encoder(time_continuous)
         
         alpha = torch.sigmoid(self.alpha(queries[:, 1].long()))
+        alpha = (alpha >= 0.2).float()  # Threshold: <0.2 -> 0, else -> 1
         gate = alpha * m + (1 - alpha)
         
         return h * r_h * gate

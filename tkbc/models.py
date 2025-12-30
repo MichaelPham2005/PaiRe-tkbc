@@ -480,15 +480,33 @@ class ContinuousTimeEmbedding(nn.Module):
         # Output: d (embedding dimension)
         self.linear = nn.Linear(2 * self.k, dim, bias=False)
     
-    def forward(self, t: torch.Tensor):
+    def forward(self, t: torch.Tensor, interval: bool = False):
         """
+        Compute Fourier-based time embedding.
+        
         Args:
-            t: (batch,) tensor of normalized timestamps in [-1, 1]
+            t: Normalized timestamps in [-1, 1]
+               - If interval=False: (batch,) tensor of point timestamps
+               - If interval=True: (batch, 2) tensor with [begin, end] timestamps
+            interval: Whether t represents intervals or points
         Returns:
             m: (batch, dim) Fourier-based time embedding
         """
+        if interval and t.dim() == 2 and t.shape[1] == 2:
+            # Handle interval: use midpoint of [begin, end]
+            t_begin = t[:, 0]  # (batch,)
+            t_end = t[:, 1]    # (batch,)
+            t_mid = (t_begin + t_end) / 2.0  # (batch,)
+            t_scalar = t_mid
+        else:
+            # Handle point timestamp
+            if t.dim() == 2:
+                t_scalar = t.squeeze(-1)  # (batch,)
+            else:
+                t_scalar = t  # (batch,)
+        
         # Compute phase: W_i * t + b_i for each frequency
-        phase = t.unsqueeze(-1) * self.W + self.b  # (batch, k)
+        phase = t_scalar.unsqueeze(-1) * self.W + self.b  # (batch, k)
         
         # Compute cos and sin for each frequency
         cos_features = torch.cos(phase)  # (batch, k)
@@ -526,7 +544,7 @@ class ContinuousPairRE(TKBCModel):
         # Relation-wise temporal gating parameter (alpha)
         # alpha close to 0 = static, alpha close to 1 = dynamic
         self.alpha = nn.Embedding(sizes[1], 1)
-        nn.init.constant_(self.alpha.weight, 0.0)  # sigmoid(0) = 0.5
+        nn.init.constant_(self.alpha.weight, 0.5)  # sigmoid(0.5) ≈ 0.62 (bias towards dynamic)
     
     @staticmethod
     def has_time():
@@ -538,8 +556,18 @@ class ContinuousPairRE(TKBCModel):
         t = self.entity_embeddings(x[:, 2].long())
         r_t = self.relation_tail(x[:, 1].long())
         
-        time_continuous = x[:, 3].float()
-        m_fourier = self.time_encoder(time_continuous)
+        # Check if input has interval (5 columns) or point (4 columns)
+        if x.shape[1] >= 5:
+            # Interval mode: [h, r, t, begin, end]
+            time_begin = x[:, 3].float()
+            time_end = x[:, 4].float()
+            time_interval = torch.stack([time_begin, time_end], dim=1)  # (batch, 2)
+            m_fourier = self.time_encoder(time_interval, interval=True)
+        else:
+            # Point mode: [h, r, t, time]
+            time_continuous = x[:, 3].float()
+            m_fourier = self.time_encoder(time_continuous, interval=False)
+        
         alpha = torch.sigmoid(self.alpha(x[:, 1].long()))
         gate = alpha * m_fourier + (1 - alpha) * torch.ones_like(m_fourier)
         
@@ -555,9 +583,17 @@ class ContinuousPairRE(TKBCModel):
         r_h = self.relation_head(x[:, 1].long())     # (batch, rank)
         r_t = self.relation_tail(x[:, 1].long())     # (batch, rank)
         
-        # Get continuous time embedding
-        time_continuous = x[:, 3].float()
-        m_fourier = self.time_encoder(time_continuous)
+        # Get continuous time embedding (handle both point and interval)
+        if x.shape[1] >= 5:
+            # Interval mode: [h, r, t, begin, end]
+            time_begin = x[:, 3].float()
+            time_end = x[:, 4].float()
+            time_interval = torch.stack([time_begin, time_end], dim=1)  # (batch, 2)
+            m_fourier = self.time_encoder(time_interval, interval=True)
+        else:
+            # Point mode: [h, r, t, time]
+            time_continuous = x[:, 3].float()
+            m_fourier = self.time_encoder(time_continuous, interval=False)
         
         # Get relation-specific gating coefficient
         alpha = torch.sigmoid(self.alpha(x[:, 1].long()))
@@ -568,21 +604,25 @@ class ContinuousPairRE(TKBCModel):
         # Get all entity embeddings
         all_entities = self.entity_embeddings.weight  # (n_entities, rank)
         
-        # For each query, compute scores against all entities
-        # Score: -||(h * r_h - entity * r_t) * gate||_1
-        scores = []
-        for i in range(batch_size):
-            h_i = h[i:i+1]  # (1, rank)
-            r_h_i = r_h[i:i+1]  # (1, rank)
-            r_t_i = r_t[i:i+1]  # (1, rank)
-            gate_i = gate[i:i+1]  # (1, rank)
-            
-            # Broadcast computation
-            interaction = (h_i * r_h_i - all_entities * r_t_i) * gate_i  # (n_entities, rank)
-            score = -torch.norm(interaction, p=1, dim=1)  # (n_entities,)
-            scores.append(score)
+        # VECTORIZED: Compute scores for all entities at once
+        # h * r_h: (batch, rank)
+        # all_entities: (n_entities, rank)
+        # r_t: (batch, rank)
+        # gate: (batch, rank)
         
-        scores = torch.stack(scores)
+        # Expand dimensions for broadcasting
+        h_r_h = (h * r_h).unsqueeze(1)  # (batch, 1, rank)
+        r_t_expanded = r_t.unsqueeze(1)  # (batch, 1, rank)
+        gate_expanded = gate.unsqueeze(1)  # (batch, 1, rank)
+        all_entities_expanded = all_entities.unsqueeze(0)  # (1, n_entities, rank)
+        
+        # Compute interaction: (h * r_h - entity * r_t) * gate
+        # Broadcasting: (batch, 1, rank) - (1, n_entities, rank) * (batch, 1, rank) -> (batch, n_entities, rank)
+        interaction = (h_r_h - all_entities_expanded * r_t_expanded) * gate_expanded
+        
+        # Compute L1 norm along rank dimension
+        scores = -torch.norm(interaction, p=1, dim=2)  # (batch, n_entities)
+        
         t = self.entity_embeddings(x[:, 2].long())
         
         factors = (
@@ -627,16 +667,62 @@ class ContinuousPairRE(TKBCModel):
     
     def forward_over_time(self, x: torch.Tensor):
         """
-        Forward pass over all timestamps (for temporal evaluation).
+        Score (h, r, t) queries over all timestamps for time prediction.
         
         Args:
-            x: Tensor of shape (batch_size, 3) containing [head, relation, tail]
+            x: (batch, 3) tensor [head, relation, tail] WITHOUT time
         Returns:
-            scores: (batch, n_timestamps) scoring across all timestamps
+            scores: (batch, n_timestamps) scores for each timestamp
         """
-        # This would require all normalized timestamps
-        # For now, raise NotImplementedError
-        raise NotImplementedError("forward_over_time requires normalized timestamp array")
+        batch_size = x.shape[0]
+        
+        # Extract components (no time in input)
+        h = self.entity_embeddings(x[:, 0].long())  # (batch, rank)
+        r_h = self.relation_head(x[:, 1].long())     # (batch, rank)
+        t = self.entity_embeddings(x[:, 2].long())   # (batch, rank)
+        r_t = self.relation_tail(x[:, 1].long())     # (batch, rank)
+        
+        # Get all normalized timestamps
+        # Assuming dataset provides ts_normalized_array or we compute it
+        # For now, create linearly spaced timestamps in [-1, 1]
+        n_timestamps = self.sizes[3]  # Number of timestamps in dataset
+        all_times = torch.linspace(-1, 1, n_timestamps).to(h.device)  # (n_timestamps,)
+        
+        # Compute time embeddings for all timestamps
+        all_m_fourier = self.time_encoder(all_times)  # (n_timestamps, rank)
+        
+        # Get relation-specific alpha
+        alpha = torch.sigmoid(self.alpha(x[:, 1].long()))  # (batch, 1)
+        
+        # Expand for broadcasting
+        # h, r_h, t, r_t: (batch, rank)
+        # all_m_fourier: (n_timestamps, rank)
+        # alpha: (batch, 1)
+        
+        # Compute interaction for each timestamp
+        h_r_h = h * r_h  # (batch, rank)
+        t_r_t = t * r_t  # (batch, rank)
+        
+        # Expand dimensions
+        h_r_h_exp = h_r_h.unsqueeze(1)  # (batch, 1, rank)
+        t_r_t_exp = t_r_t.unsqueeze(1)  # (batch, 1, rank)
+        alpha_exp = alpha.unsqueeze(1)  # (batch, 1, 1)
+        all_m_exp = all_m_fourier.unsqueeze(0)  # (1, n_timestamps, rank)
+        
+        # Compute gate for all timestamps: G(m,r) = alpha * m + (1-alpha) * 1
+        # Broadcasting: (batch, 1, 1) * (1, n_timestamps, rank) + (batch, 1, 1)
+        gate_all = alpha_exp * all_m_exp + (1 - alpha_exp) * torch.ones_like(all_m_exp)
+        # gate_all: (batch, n_timestamps, rank)
+        
+        # Compute interaction: (h * r_h - t * r_t) * gate
+        # (batch, 1, rank) - (batch, 1, rank) = (batch, 1, rank)
+        # Then broadcast with gate_all: (batch, n_timestamps, rank)
+        interaction = (h_r_h_exp - t_r_t_exp) * gate_all
+        
+        # Compute scores: -||interaction||_1
+        scores = -torch.norm(interaction, p=1, dim=2)  # (batch, n_timestamps)
+        
+        return scores
     
     def get_rhs(self, chunk_begin: int, chunk_size: int):
         """Get entity embeddings for ranking."""

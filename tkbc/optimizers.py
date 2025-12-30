@@ -133,13 +133,15 @@ class ContinuousTimeOptimizer(object):
             emb_regularizer: Regularizer, temporal_regularizer: Regularizer,
             optimizer: optim.Optimizer, dataset: TemporalDataset,
             batch_size: int = 256, verbose: bool = True,
-            smoothness_regularizer: Regularizer = None
+            smoothness_regularizer: Regularizer = None,
+            alpha_regularizer: Regularizer = None
     ):
         self.model = model
         self.dataset = dataset
         self.emb_regularizer = emb_regularizer
         self.temporal_regularizer = temporal_regularizer
         self.smoothness_regularizer = smoothness_regularizer
+        self.alpha_regularizer = alpha_regularizer
         self.optimizer = optimizer
         self.batch_size = batch_size
         self.verbose = verbose
@@ -186,7 +188,13 @@ class ContinuousTimeOptimizer(object):
                     b = self.model.time_encoder.b
                     l_smooth = self.smoothness_regularizer.forward(W, b)
                 
-                l = l_fit + l_reg + l_time + l_smooth
+                # Add alpha polarization regularization
+                l_alpha = torch.zeros_like(l_reg)
+                if self.alpha_regularizer is not None and hasattr(self.model, 'alpha'):
+                    alpha_weights = self.model.alpha.weight
+                    l_alpha = self.alpha_regularizer.forward(alpha_weights)
+                
+                l = l_fit + l_reg + l_time + l_smooth + l_alpha
 
                 self.optimizer.zero_grad()
                 l.backward()
@@ -197,5 +205,6 @@ class ContinuousTimeOptimizer(object):
                     loss=f'{l_fit.item():.0f}',
                     reg=f'{l_reg.item():.0f}',
                     cont=f'{l_time.item():.0f}',
-                    smooth=f'{l_smooth.item():.4f}'
+                    smooth=f'{l_smooth.item():.4f}',
+                    alpha=f'{l_alpha.item():.4f}'
                 )

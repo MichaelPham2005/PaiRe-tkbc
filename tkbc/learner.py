@@ -12,7 +12,7 @@ from pathlib import Path
 from datasets import TemporalDataset
 from optimizers import TKBCOptimizer, IKBCOptimizer, ContinuousTimeOptimizer
 from models import ComplEx, TComplEx, TNTComplEx, ContinuousPairRE
-from regularizers import N3, Lambda3, ContinuousTimeLambda3, ContinuitySmoothness
+from regularizers import N3, Lambda3, ContinuousTimeLambda3, ContinuitySmoothness, AlphaPolarization
 
 parser = argparse.ArgumentParser(
     description="Temporal ComplEx"
@@ -59,6 +59,10 @@ parser.add_argument(
 parser.add_argument(
     '--smoothness_reg', default=0., type=float,
     help="Continuity smoothness regularizer for W and b (ContinuousPairRE only)"
+)
+parser.add_argument(
+    '--alpha_reg', default=0., type=float,
+    help="Alpha polarization regularizer (push toward 0 or 1, ContinuousPairRE only)"
 )
 parser.add_argument(
     '--no_time_emb', default=False, action="store_true",
@@ -115,6 +119,7 @@ print(f"Embedding regularization (N3): {args.emb_reg}")
 print(f"Time regularization: {args.time_reg}")
 if args.model == 'ContinuousPairRE':
     print(f"Smoothness regularization (W/b): {args.smoothness_reg}")
+    print(f"Alpha polarization regularization: {args.alpha_reg}")
 print(f"Checkpoint directory: {checkpoint_dir}")
 print("="*70 + "\n")
 
@@ -125,6 +130,8 @@ emb_reg = N3(args.emb_reg)
 time_reg = ContinuousTimeLambda3(args.time_reg) if args.model == 'ContinuousPairRE' else Lambda3(args.time_reg)
 # Add smoothness regularizer for continuous time models
 smoothness_reg = ContinuitySmoothness(args.smoothness_reg) if args.model == 'ContinuousPairRE' else None
+# Add alpha polarization regularizer
+alpha_reg = AlphaPolarization(args.alpha_reg) if args.model == 'ContinuousPairRE' else None
 
 # Track best validation MRR for saving best model
 best_valid_mrr = 0.0
@@ -149,7 +156,8 @@ for epoch in range(args.max_epochs):
         optimizer = ContinuousTimeOptimizer(
             model, emb_reg, time_reg, opt, dataset,
             batch_size=args.batch_size,
-            smoothness_regularizer=smoothness_reg
+            smoothness_regularizer=smoothness_reg,
+            alpha_regularizer=alpha_reg
         )
         optimizer.epoch(examples)
     else:

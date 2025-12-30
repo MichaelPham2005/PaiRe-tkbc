@@ -498,7 +498,7 @@ class ContinuousPairRE(TKBCModel):
         # Relation-wise temporal gating parameter (alpha)
         # alpha close to 0 = static, alpha close to 1 = dynamic
         self.alpha = nn.Embedding(sizes[1], 1)
-        nn.init.constant_(self.alpha.weight, 0.5)  # Initialize to 0.5
+        nn.init.constant_(self.alpha.weight, 0.0)  # sigmoid(0) = 0.5
     
     @staticmethod
     def has_time():
@@ -513,10 +513,10 @@ class ContinuousPairRE(TKBCModel):
         time_continuous = x[:, 3].float()
         m = self.time_encoder(time_continuous)
         alpha = torch.sigmoid(self.alpha(x[:, 1].long()))
-        gate = alpha * m + (1 - alpha)
+        gate = alpha * m + (1 - alpha) * torch.ones_like(m)
         
         interaction = (h * r_h - t * r_t) * gate
-        score = -torch.abs(interaction).sum(dim=-1)
+        score = -torch.norm(interaction, p=1, dim=-1)
         return score
     
     def forward(self, x: torch.Tensor):
@@ -534,8 +534,8 @@ class ContinuousPairRE(TKBCModel):
         # Get relation-specific gating coefficient
         alpha = torch.sigmoid(self.alpha(x[:, 1].long()))
         
-        # Compute gated time modulation
-        gate = alpha * m + (1 - alpha)
+        # Compute gated time modulation: G(m,r) = alpha_r * m + (1 - alpha_r) * 1
+        gate = alpha * m + (1 - alpha) * torch.ones_like(m)
         
         # Get all entity embeddings
         all_entities = self.entity_embeddings.weight  # (n_entities, rank)
@@ -625,7 +625,7 @@ class ContinuousPairRE(TKBCModel):
         m = self.time_encoder(time_continuous)
         
         alpha = torch.sigmoid(self.alpha(queries[:, 1].long()))
-        gate = alpha * m + (1 - alpha)
+        gate = alpha * m + (1 - alpha) * torch.ones_like(m)
         
         return h * r_h * gate
 

@@ -81,3 +81,45 @@ class ContinuitySmoothness(Regularizer):
             return freq_reg + phase_reg
         
         return freq_reg
+
+
+class AlphaPolarization(Regularizer):
+    """
+    Polarization regularizer for alpha parameters.
+    Encourages alpha_r to be close to 0 (static) or 1 (dynamic).
+    
+    Uses entropy-based penalty: H(alpha) = -alpha*log(alpha) - (1-alpha)*log(1-alpha)
+    Minimum entropy at alpha=0 or alpha=1 (polarized).
+    Maximum entropy at alpha=0.5 (uncertain).
+    """
+    def __init__(self, weight: float):
+        super(AlphaPolarization, self).__init__()
+        self.weight = weight
+    
+    def forward(self, alpha_raw: torch.Tensor):
+        """
+        Apply polarization penalty to push alphas toward 0 or 1.
+        
+        Args:
+            alpha_raw: Raw alpha logits (before sigmoid), shape (num_relations, 1)
+        Returns:
+            Polarization loss (scalar)
+        """
+        if alpha_raw is None or self.weight == 0:
+            return torch.tensor(0.0)
+        
+        # Apply sigmoid to get alpha in (0, 1)
+        alpha = torch.sigmoid(alpha_raw)
+        
+        # Clip to avoid log(0)
+        eps = 1e-7
+        alpha = torch.clamp(alpha, eps, 1 - eps)
+        
+        # Binary entropy: H = -alpha*log(alpha) - (1-alpha)*log(1-alpha)
+        # We want to MINIMIZE entropy (maximize polarization)
+        entropy = -alpha * torch.log(alpha) - (1 - alpha) * torch.log(1 - alpha)
+        
+        # Average over all relations
+        polarization_loss = self.weight * torch.mean(entropy)
+        
+        return polarization_loss

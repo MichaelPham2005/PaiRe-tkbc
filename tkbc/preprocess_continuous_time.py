@@ -71,7 +71,7 @@ def normalize_timestamps(dataset_name):
     
     real_timestamps = np.array(real_timestamps)
     
-    # Min-Max normalization to [0, 100]
+    # Min-Max normalization to [-1, 1]
     t_min = real_timestamps.min()
     t_max = real_timestamps.max()
     
@@ -79,7 +79,7 @@ def normalize_timestamps(dataset_name):
         print(f"Warning: All timestamps are the same in {dataset_name}")
         normalized_timestamps = np.zeros_like(real_timestamps)
     else:
-        normalized_timestamps = (real_timestamps - t_min) / (t_max - t_min) * 100.0
+        normalized_timestamps = 2.0 * (real_timestamps - t_min) / (t_max - t_min) - 1.0
     
     print(f"Time range: {date_strings[0]} to {date_strings[-1]}")
     print(f"Normalized range: [{normalized_timestamps.min():.2f}, {normalized_timestamps.max():.2f}]")

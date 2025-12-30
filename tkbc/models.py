@@ -551,7 +551,7 @@ class ContinuousPairRE(TKBCModel):
             
             # Broadcast computation
             interaction = (h_i * r_h_i - all_entities * r_t_i) * gate_i  # (n_entities, rank)
-            score = -torch.abs(interaction).sum(dim=1)  # (n_entities,)
+            score = -torch.norm(interaction, p=1, dim=1)  # (n_entities,)
             scores.append(score)
         
         scores = torch.stack(scores)

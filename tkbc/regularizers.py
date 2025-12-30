@@ -53,7 +53,7 @@ class ContinuousTimeLambda3(Regularizer):
 
 class ContinuitySmoothness(Regularizer):
     """
-    Continuity regularizer for time embeddings m = cos(W·t + b).
+    Continuity regularizer for Fourier-based time embeddings.
     Encourages W to have reasonable frequencies (not too high).
     High W → rapid oscillation → discontinuous-looking m.
     """
@@ -61,12 +61,13 @@ class ContinuitySmoothness(Regularizer):
         super(ContinuitySmoothness, self).__init__()
         self.weight = weight
     
-    def forward(self, W: torch.Tensor, b: torch.Tensor = None):
+    def forward(self, W: torch.Tensor, b: torch.Tensor = None, linear_weight: torch.Tensor = None):
         """
-        Regularize W to prevent extremely high frequencies.
+        Regularize W, b, and optionally the linear layer weights.
         Args:
-            W: frequency parameter (rank,)
-            b: phase parameter (rank,) - optional
+            W: frequency parameter (k,)
+            b: phase parameter (k,) - optional
+            linear_weight: linear layer weights (d, 2k) - optional
         """
         if W is None:
             return torch.tensor(0.0)
@@ -78,7 +79,12 @@ class ContinuitySmoothness(Regularizer):
         # Optionally regularize b as well (usually not needed)
         if b is not None and self.weight > 0:
             phase_reg = self.weight * 0.1 * torch.sum(b ** 2)  # smaller weight for b
-            return freq_reg + phase_reg
+            freq_reg = freq_reg + phase_reg
+        
+        # Optionally regularize linear layer to prevent extreme weights
+        if linear_weight is not None and self.weight > 0:
+            linear_reg = self.weight * 0.01 * torch.sum(linear_weight ** 2)
+            freq_reg = freq_reg + linear_reg
         
         return freq_reg
 

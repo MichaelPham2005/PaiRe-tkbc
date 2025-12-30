@@ -181,12 +181,13 @@ class ContinuousTimeOptimizer(object):
                 if time is not None:
                     l_time = self.temporal_regularizer.forward(time)
                 
-                # Add smoothness regularization on W and b
+                # Add smoothness regularization on W, b, and linear layer
                 l_smooth = torch.zeros_like(l_reg)
                 if self.smoothness_regularizer is not None and hasattr(self.model, 'time_encoder'):
                     W = self.model.time_encoder.W
                     b = self.model.time_encoder.b
-                    l_smooth = self.smoothness_regularizer.forward(W, b)
+                    linear_weight = self.model.time_encoder.linear.weight if hasattr(self.model.time_encoder, 'linear') else None
+                    l_smooth = self.smoothness_regularizer.forward(W, b, linear_weight)
                 
                 # Add alpha polarization regularization
                 l_alpha = torch.zeros_like(l_reg)

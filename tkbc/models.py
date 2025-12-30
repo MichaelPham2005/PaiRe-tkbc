@@ -464,15 +464,43 @@ class TNTComplEx(TKBCModel):
 
 
 class ContinuousTimeEmbedding(nn.Module):
-    """Continuous time embedding: m = cos(W*t + b)"""
+    """Fourier-based time embedding: m = Linear([cos(W₁t+b₁), sin(W₁t+b₁), ..., cos(Wₖt+bₖ), sin(Wₖt+bₖ)])"""
     def __init__(self, dim: int):
         super(ContinuousTimeEmbedding, self).__init__()
         self.dim = dim
-        self.W = nn.Parameter(torch.randn(dim) * 0.01)
-        self.b = nn.Parameter(torch.zeros(dim))
+        # k is number of frequencies (usually k = d/2)
+        self.k = dim // 2
+        
+        # W and b for each frequency component
+        self.W = nn.Parameter(torch.randn(self.k) * 0.01)
+        self.b = nn.Parameter(torch.zeros(self.k))
+        
+        # Linear layer to project Fourier features to embedding dimension
+        # Input: 2k (cos and sin for each frequency)
+        # Output: d (embedding dimension)
+        self.linear = nn.Linear(2 * self.k, dim, bias=False)
     
     def forward(self, t: torch.Tensor):
-        return torch.cos(t.unsqueeze(-1) * self.W + self.b)
+        """
+        Args:
+            t: (batch,) tensor of normalized timestamps in [-1, 1]
+        Returns:
+            m: (batch, dim) Fourier-based time embedding
+        """
+        # Compute phase: W_i * t + b_i for each frequency
+        phase = t.unsqueeze(-1) * self.W + self.b  # (batch, k)
+        
+        # Compute cos and sin for each frequency
+        cos_features = torch.cos(phase)  # (batch, k)
+        sin_features = torch.sin(phase)  # (batch, k)
+        
+        # Concatenate: [cos(W₁t+b₁), sin(W₁t+b₁), ..., cos(Wₖt+bₖ), sin(Wₖt+bₖ)]
+        fourier_features = torch.cat([cos_features, sin_features], dim=-1)  # (batch, 2k)
+        
+        # Linear projection to embedding dimension
+        m = self.linear(fourier_features)  # (batch, dim)
+        
+        return m
 
 
 class ContinuousPairRE(TKBCModel):
@@ -511,9 +539,9 @@ class ContinuousPairRE(TKBCModel):
         r_t = self.relation_tail(x[:, 1].long())
         
         time_continuous = x[:, 3].float()
-        m = self.time_encoder(time_continuous)
+        m_fourier = self.time_encoder(time_continuous)
         alpha = torch.sigmoid(self.alpha(x[:, 1].long()))
-        gate = alpha * m + (1 - alpha) * torch.ones_like(m)
+        gate = alpha * m_fourier + (1 - alpha) * torch.ones_like(m_fourier)
         
         interaction = (h * r_h - t * r_t) * gate
         score = -torch.norm(interaction, p=1, dim=-1)
@@ -529,13 +557,13 @@ class ContinuousPairRE(TKBCModel):
         
         # Get continuous time embedding
         time_continuous = x[:, 3].float()
-        m = self.time_encoder(time_continuous)
+        m_fourier = self.time_encoder(time_continuous)
         
         # Get relation-specific gating coefficient
         alpha = torch.sigmoid(self.alpha(x[:, 1].long()))
         
-        # Compute gated time modulation: G(m,r) = alpha_r * m + (1 - alpha_r) * 1
-        gate = alpha * m + (1 - alpha) * torch.ones_like(m)
+        # Compute gated time modulation: G(m,r) = alpha_r * m_fourier + (1 - alpha_r) * 1
+        gate = alpha * m_fourier + (1 - alpha) * torch.ones_like(m_fourier)
         
         # Get all entity embeddings
         all_entities = self.entity_embeddings.weight  # (n_entities, rank)
@@ -562,7 +590,7 @@ class ContinuousPairRE(TKBCModel):
             torch.sqrt(r_h ** 2 + r_t ** 2 + 1e-10),
             torch.sqrt(t ** 2 + 1e-10)
         )
-        return scores, factors, m
+        return scores, factors, m_fourier
     
     def get_ranking(self, queries: torch.Tensor, filters: Dict[Tuple[int, int, int], List[int]],
                     batch_size: int = 1000, chunk_size: int = -1, timestamp_ids: torch.Tensor = None):
@@ -622,10 +650,10 @@ class ContinuousPairRE(TKBCModel):
         r_h = self.relation_head(queries[:, 1].long())
         
         time_continuous = queries[:, 3].float()
-        m = self.time_encoder(time_continuous)
+        m_fourier = self.time_encoder(time_continuous)
         
         alpha = torch.sigmoid(self.alpha(queries[:, 1].long()))
-        gate = alpha * m + (1 - alpha) * torch.ones_like(m)
+        gate = alpha * m_fourier + (1 - alpha) * torch.ones_like(m_fourier)
         
         return h * r_h * gate
 

@@ -134,7 +134,10 @@ class ContinuousTimeOptimizer(object):
             optimizer: optim.Optimizer, dataset: TemporalDataset,
             batch_size: int = 256, verbose: bool = True,
             smoothness_regularizer: Regularizer = None,
-            alpha_regularizer: Regularizer = None
+            alpha_regularizer: Regularizer = None,
+            loss_type: str = 'cross_entropy',
+            margin: float = 6.0,
+            adversarial_temperature: float = 1.0
     ):
         self.model = model
         self.dataset = dataset
@@ -145,13 +148,19 @@ class ContinuousTimeOptimizer(object):
         self.optimizer = optimizer
         self.batch_size = batch_size
         self.verbose = verbose
+        self.loss_type = loss_type
+        self.margin = margin
+        self.adversarial_temperature = adversarial_temperature
         
         if not hasattr(dataset, 'ts_normalized') or dataset.ts_normalized is None:
             raise ValueError("Dataset must have continuous time mappings loaded")
 
     def epoch(self, examples: torch.LongTensor):
         actual_examples = examples[torch.randperm(examples.shape[0]), :]
-        loss = nn.CrossEntropyLoss(reduction='mean')
+        
+        # Define loss function based on type
+        if self.loss_type == 'cross_entropy':
+            loss_fn = nn.CrossEntropyLoss(reduction='mean')
         
         with tqdm.tqdm(total=examples.shape[0], unit='ex', disable=not self.verbose) as bar:
             bar.set_description(f'train loss')
@@ -175,7 +184,55 @@ class ContinuousTimeOptimizer(object):
                 predictions, factors, time = self.model.forward(batch_with_continuous_time)
                 truth = input_batch[:, 2].cuda()
 
-                l_fit = loss(predictions, truth)
+                if self.loss_type == 'cross_entropy':
+                    l_fit = loss_fn(predictions, truth)
+                elif self.loss_type == 'self_adversarial':
+                    # Self-Adversarial Negative Sampling Loss
+                    # predictions: (batch, n_entities) - these are SCORES (-distance)
+                    # truth: (batch,) - indices of positive entities
+                    
+                    # 1. Get positive scores
+                    # Gather scores at truth indices: (batch, 1)
+                    pos_scores = predictions.gather(1, truth.view(-1, 1))
+                    
+                    # 2. Get negative scores (all others)
+                    # We can treat all non-truth as negatives (1-vs-All approach)
+                    # Or mask out the positive
+                    # For efficiency with 1-vs-All, we use all scores but mask the positive for the negative part
+                    
+                    # Create mask for negatives
+                    batch_size, n_entities = predictions.shape
+                    neg_mask = torch.ones((batch_size, n_entities), dtype=torch.bool, device=predictions.device)
+                    neg_mask.scatter_(1, truth.view(-1, 1), 0)
+                    
+                    # Negative scores: (batch, n_entities - 1)
+                    neg_scores = predictions[neg_mask].view(batch_size, -1)
+                    
+                    # 3. Compute Self-Adversarial Weights for negatives
+                    # p(h, r, t') = exp(alpha * f_r(h, t')) / sum(exp(alpha * f_r(h, t'_j)))
+                    # Note: f_r is distance. Our scores are -distance.
+                    # So we want weights proportional to exp(alpha * (distance)).
+                    # Wait, hard negatives have SMALL distance (large score).
+                    # We want to weight HARD negatives more.
+                    # Hard negatives have score close to 0 (large). Easy negatives have score very negative (small).
+                    # So softmax(score) gives higher weight to larger scores (hard negatives). Correct.
+                    
+                    neg_weights = torch.softmax(neg_scores * self.adversarial_temperature, dim=1).detach()
+                    
+                    # 4. Compute Loss
+                    # L = -log(sigmoid(gamma - distance_pos)) - sum(p * log(sigmoid(distance_neg - gamma)))
+                    # Substitute distance = -score
+                    # L = -log(sigmoid(gamma + score_pos)) - sum(p * log(sigmoid(-score_neg - gamma)))
+                    
+                    loss_pos = -torch.log(torch.sigmoid(self.margin + pos_scores) + 1e-9).mean()
+                    
+                    loss_neg = -torch.sum(
+                        neg_weights * torch.log(torch.sigmoid(-neg_scores - self.margin) + 1e-9),
+                        dim=1
+                    ).mean()
+                    
+                    l_fit = (loss_pos + loss_neg) / 2
+                
                 l_reg = self.emb_regularizer.forward(factors)
                 l_time = torch.zeros_like(l_reg)
                 if time is not None:
@@ -203,7 +260,7 @@ class ContinuousTimeOptimizer(object):
                 b_begin += self.batch_size
                 bar.update(input_batch.shape[0])
                 bar.set_postfix(
-                    loss=f'{l_fit.item():.0f}',
+                    loss=f'{l_fit.item():.4f}',
                     reg=f'{l_reg.item():.0f}',
                     cont=f'{l_time.item():.0f}',
                     smooth=f'{l_smooth.item():.4f}',

@@ -65,6 +65,18 @@ parser.add_argument(
     help="Alpha polarization regularizer (push toward 0 or 1, ContinuousPairRE only)"
 )
 parser.add_argument(
+    '--loss', default='cross_entropy', choices=['cross_entropy', 'self_adversarial'],
+    help="Loss function to use. 'cross_entropy' is standard Softmax. 'self_adversarial' is PairRE/RotatE style."
+)
+parser.add_argument(
+    '--margin', default=6.0, type=float,
+    help="Margin gamma for Self-Adversarial Loss"
+)
+parser.add_argument(
+    '--adversarial_temperature', default=1.0, type=float,
+    help="Temperature alpha for self-adversarial negative sampling"
+)
+parser.add_argument(
     '--no_time_emb', default=False, action="store_true",
     help="Use a specific embedding for non temporal relations"
 )
@@ -157,7 +169,10 @@ for epoch in range(args.max_epochs):
             model, emb_reg, time_reg, opt, dataset,
             batch_size=args.batch_size,
             smoothness_regularizer=smoothness_reg,
-            alpha_regularizer=alpha_reg
+            alpha_regularizer=alpha_reg,
+            loss_type=args.loss,
+            margin=args.margin,
+            adversarial_temperature=args.adversarial_temperature
         )
         optimizer.epoch(examples)
     else:

@@ -497,8 +497,9 @@ class RelationConditionedTimeEncoder(nn.Module):
         
         # Global frequencies: omega ∈ R^K (shared across all relations)
         # Initialize with log-spaced frequencies for better coverage
+        # FIXED (not learnable as per spec section 11)
         omega_init = torch.logspace(0, np.log10(10), K)  # [1, ..., 10]
-        self.omega = nn.Parameter(omega_init)
+        self.register_buffer('omega', omega_init)
         
         # Projection layer: (1 + K) -> dim
         self.W_proj = nn.Parameter(torch.empty(dim, 1 + K))

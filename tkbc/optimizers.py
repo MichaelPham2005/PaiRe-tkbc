@@ -213,6 +213,11 @@ class ContinuousTimeOptimizer(object):
                 
                 # Time Discrimination Loss (CRITICAL FOR NEW MODEL)
                 l_time_disc = torch.zeros_like(l_fit)
+                raw_t_disc = torch.zeros_like(l_fit)
+                score_diff_mean = 0.0
+                score_diff_std = 0.0
+                tau_collision_rate = 0.0
+                
                 if self.time_discrimination_weight > 0 and hasattr(self.model, 'score'):
                     # Sample negative times for each positive
                     n_times = len(self.dataset.ts_normalized)
@@ -232,8 +237,19 @@ class ContinuousTimeOptimizer(object):
                     score_neg_time = self.model.score(batch_neg_time)  # (batch,)
                     
                     # Time discrimination loss: -log σ(φ(+) - φ(-))
-                    l_time_disc = -torch.log(torch.sigmoid(score_pos - score_neg_time) + 1e-9).mean()
-                    l_time_disc = self.time_discrimination_weight * l_time_disc
+                    raw_t_disc = -torch.log(torch.sigmoid(score_pos - score_neg_time) + 1e-9).mean()
+                    l_time_disc = self.time_discrimination_weight * raw_t_disc
+                    
+                    # Step C: Check score difference and tau collision
+                    score_diff = score_pos - score_neg_time
+                    score_diff_mean = score_diff.mean().item()
+                    score_diff_std = score_diff.std().item()
+                    
+                    # Check if negative times accidentally match positive times
+                    # Compare time_ids (integers), not continuous values
+                    pos_time_ids = input_batch[:, 3].cpu()  # Original time_ids
+                    tau_collision_rate = (neg_time_ids.cpu() == pos_time_ids).float().mean().item()
+
                 
                 l_reg = self.emb_regularizer.forward(factors)
                 l_time = torch.zeros_like(l_reg)
@@ -251,16 +267,82 @@ class ContinuousTimeOptimizer(object):
 
                 self.optimizer.zero_grad()
                 l.backward()
+                
+                # TEST B1: Gradient norm tracking (every 50 batches)
+                batch_idx = (b_begin) // self.batch_size
+                if batch_idx % 50 == 0:
+                    grad_entity = 0.0
+                    grad_relation = 0.0
+                    grad_time = 0.0
+                    
+                    if self.model.entity_embeddings.weight.grad is not None:
+                        grad_entity = self.model.entity_embeddings.weight.grad.norm().item()
+                    
+                    if self.model.relation_head.weight.grad is not None:
+                        grad_relation += self.model.relation_head.weight.grad.norm().item()
+                    if self.model.relation_tail.weight.grad is not None:
+                        grad_relation += self.model.relation_tail.weight.grad.norm().item()
+                    
+                    if hasattr(self.model, 'time_encoder'):
+                        if self.model.time_encoder.a_r.grad is not None:
+                            grad_time += self.model.time_encoder.a_r.grad.norm().item()
+                        if self.model.time_encoder.A_r.grad is not None:
+                            grad_time += self.model.time_encoder.A_r.grad.norm().item()
+                        if self.model.time_encoder.P_r.grad is not None:
+                            grad_time += self.model.time_encoder.P_r.grad.norm().item()
+                        if self.model.time_encoder.W_proj.grad is not None:
+                            grad_time += self.model.time_encoder.W_proj.grad.norm().item()
+                    
+                    grad_all = grad_entity + grad_relation + grad_time
+                    time_grad_ratio = grad_time / grad_all if grad_all > 0 else 0.0
+                    
+                    postfix_dict['grad_ent'] = f'{grad_entity:.2e}'
+                    postfix_dict['grad_rel'] = f'{grad_relation:.2e}'
+                    postfix_dict['grad_time'] = f'{grad_time:.2e}'
+                    postfix_dict['time_ratio'] = f'{time_grad_ratio*100:.1f}%'
+                
                 self.optimizer.step()
                 b_begin += self.batch_size
                 bar.update(input_batch.shape[0])
-                bar.set_postfix(
-                    loss=f'{l_fit.item():.4f}',
-                    reg=f'{l_reg.item():.0f}',
-                    cont=f'{l_time.item():.0f}',
-                    t_param=f'{l_time_param.item():.4f}',
-                    t_disc=f'{l_time_disc.item():.4f}'
-                )
+                
+                # Standard postfix
+                postfix_dict = {
+                    'loss': f'{l_fit.item():.4f}',
+                    'reg': f'{l_reg.item():.0f}',
+                    'cont': f'{l_time.item():.0f}',
+                    't_param': f'{l_time_param.item():.4f}',
+                    't_disc': f'{l_time_disc.item():.4f}'
+                }
+                
+                # Bước A & B: Detailed diagnostics every 50 batches
+                batch_idx = (b_begin - self.batch_size) // self.batch_size
+                if batch_idx % 50 == 0 and self.time_discrimination_weight > 0:
+                    # Step A: Check raw vs weighted
+                    raw_value = raw_t_disc.item() if isinstance(raw_t_disc, torch.Tensor) else 0.0
+                    weighted_value = l_time_disc.item() if isinstance(l_time_disc, torch.Tensor) else 0.0
+                    
+                    # Step B: Check backprop
+                    requires_grad = raw_t_disc.requires_grad if isinstance(raw_t_disc, torch.Tensor) else False
+                    has_grad_fn = raw_t_disc.grad_fn is not None if isinstance(raw_t_disc, torch.Tensor) else False
+                    ratio = weighted_value / (l.item() + 1e-9)
+                    
+                    print(f"\n[Batch {batch_idx}] TIME DISCRIMINATION DIAGNOSTICS:")
+                    print(f"  Step A - Loss values:")
+                    print(f"    raw_t_disc (before weight): {raw_value:.6f}")
+                    print(f"    weighted_t_disc (after x lambda): {weighted_value:.6f}")
+                    print(f"    lambda_time: {self.time_discrimination_weight}")
+                    print(f"    Expected weighted: {raw_value * self.time_discrimination_weight:.6f}")
+                    print(f"  Step B - Backprop check:")
+                    print(f"    requires_grad: {requires_grad}")
+                    print(f"    has_grad_fn: {has_grad_fn}")
+                    print(f"    ratio (t_disc/total_loss): {ratio:.4f}")
+                    print(f"  Step C - Score difference:")
+                    print(f"    mean(score_pos - score_neg): {score_diff_mean:.6f}")
+                    print(f"    std(score_pos - score_neg): {score_diff_std:.6f}")
+                    print(f"    tau collision rate: {tau_collision_rate:.4f}")
+                    print(f"  Total loss: {l.item():.6f} = fit:{l_fit.item():.4f} + reg:{l_reg.item():.4f} + t_param:{l_time_param.item():.4f} + t_disc:{weighted_value:.4f}")
+                
+                bar.set_postfix(postfix_dict)
         
         # Increment epoch counter after processing all batches
         self.current_epoch += 1

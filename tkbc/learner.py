@@ -189,6 +189,28 @@ for epoch in range(args.max_epochs):
             time_discrimination_weight=args.time_discrimination_weight
         )
         optimizer.epoch(examples)
+        
+        # TEST B2: Track parameter updates every epoch
+        if args.model == 'ContinuousPairRE' and hasattr(model, 'time_encoder'):
+            with torch.no_grad():
+                if hasattr(model, '_prev_params'):
+                    delta_a_r = (model.time_encoder.a_r - model._prev_params['a_r']).norm().item()
+                    delta_A_r = (model.time_encoder.A_r - model._prev_params['A_r']).norm().item()
+                    delta_P_r = (model.time_encoder.P_r - model._prev_params['P_r']).norm().item()
+                    delta_W_proj = (model.time_encoder.W_proj - model._prev_params['W_proj']).norm().item()
+                    
+                    print(f"[Epoch {epoch+1}] Parameter Updates: Δa_r={delta_a_r:.2e}, ΔA_r={delta_A_r:.2e}, ΔP_r={delta_P_r:.2e}, ΔW_proj={delta_W_proj:.2e}")
+                    
+                    if delta_a_r < 1e-6 and delta_A_r < 1e-6:
+                        print("  ⚠️  WARNING: Time parameters barely changing!")
+                
+                # Save current for next comparison
+                model._prev_params = {
+                    'a_r': model.time_encoder.a_r.clone(),
+                    'A_r': model.time_encoder.A_r.clone(),
+                    'P_r': model.time_encoder.P_r.clone(),
+                    'W_proj': model.time_encoder.W_proj.clone()
+                }
     else:
         optimizer = TKBCOptimizer(
             model, emb_reg, time_reg, opt,

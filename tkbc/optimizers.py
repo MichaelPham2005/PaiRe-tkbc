@@ -268,6 +268,15 @@ class ContinuousTimeOptimizer(object):
                 self.optimizer.zero_grad()
                 l.backward()
                 
+                # Initialize postfix_dict first
+                postfix_dict = {
+                    'loss': f'{l_fit.item():.4f}',
+                    'reg': f'{l_reg.item():.0f}',
+                    'cont': f'{l_time.item():.0f}',
+                    't_param': f'{l_time_param.item():.4f}',
+                    't_disc': f'{l_time_disc.item():.4f}'
+                }
+                
                 # TEST B1: Gradient norm tracking (every 50 batches)
                 batch_idx = (b_begin) // self.batch_size
                 if batch_idx % 50 == 0:
@@ -304,15 +313,6 @@ class ContinuousTimeOptimizer(object):
                 self.optimizer.step()
                 b_begin += self.batch_size
                 bar.update(input_batch.shape[0])
-                
-                # Standard postfix
-                postfix_dict = {
-                    'loss': f'{l_fit.item():.4f}',
-                    'reg': f'{l_reg.item():.0f}',
-                    'cont': f'{l_time.item():.0f}',
-                    't_param': f'{l_time_param.item():.4f}',
-                    't_disc': f'{l_time_disc.item():.4f}'
-                }
                 
                 # Bước A & B: Detailed diagnostics every 50 batches
                 batch_idx = (b_begin - self.batch_size) // self.batch_size

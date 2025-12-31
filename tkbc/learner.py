@@ -12,7 +12,7 @@ from pathlib import Path
 from datasets import TemporalDataset
 from optimizers import TKBCOptimizer, IKBCOptimizer, ContinuousTimeOptimizer
 from models import ComplEx, TComplEx, TNTComplEx, ContinuousPairRE
-from regularizers import N3, Lambda3, ContinuousTimeLambda3, ContinuitySmoothness, AlphaPolarization
+from regularizers import N3, Lambda3, ContinuousTimeLambda3, TimeParameterRegularizer
 
 parser = argparse.ArgumentParser(
     description="Temporal ComplEx"
@@ -215,20 +215,19 @@ for epoch in range(args.max_epochs):
         print(f"EPOCH {epoch + 1}/{args.max_epochs} - VALIDATION (every {args.valid_freq} epochs)")
         print(f"{'='*70}")
         
-        # Print alpha statistics for ContinuousPairRE to monitor temporal gating
-        if args.model == 'ContinuousPairRE':
+        # Print time encoder statistics for ContinuousPairRE
+        if args.model == 'ContinuousPairRE' and hasattr(model, 'time_encoder'):
             with torch.no_grad():
-                alphas = torch.sigmoid(model.alpha.weight).cpu()
-                print(f"\nAlpha Statistics:")
-                print(f"  Mean: {alphas.mean().item():.4f}")
-                print(f"  Std:  {alphas.std().item():.4f}")
-                print(f"  Min:  {alphas.min().item():.4f}")
-                print(f"  Max:  {alphas.max().item():.4f}")
-                # Count static vs dynamic relations
-                static_count = (alphas < 0.3).sum().item()
-                dynamic_count = (alphas > 0.7).sum().item()
-                print(f"  Static relations (α<0.3): {static_count}/{len(alphas)}")
-                print(f"  Dynamic relations (α>0.7): {dynamic_count}/{len(alphas)}")
+                a_r = model.time_encoder.a_r.cpu()
+                A_r = model.time_encoder.A_r.cpu()
+                print(f"\nTime Encoder Statistics:")
+                print(f"  Beta (gate strength): {model.beta:.4f}")
+                print(f"  Trend (a_r):")
+                print(f"    Mean: {a_r.mean().item():.4f}, Std: {a_r.std().item():.4f}")
+                print(f"    Range: [{a_r.min().item():.4f}, {a_r.max().item():.4f}]")
+                print(f"  Amplitude (A_r):")
+                print(f"    Mean: {A_r.mean().item():.4f}, Std: {A_r.std().item():.4f}")
+                print(f"    Range: [{A_r.min().item():.4f}, {A_r.max().item():.4f}]")
         
         model.eval()
         with torch.no_grad():
@@ -255,18 +254,16 @@ for epoch in range(args.max_epochs):
         with open(log_file, 'a', encoding='utf-8') as f:
             f.write(f"\nEpoch {epoch + 1}/{args.max_epochs}\n")
             f.write(f"{'-'*70}\n")
-            if args.model == 'ContinuousPairRE':
+            if args.model == 'ContinuousPairRE' and hasattr(model, 'time_encoder'):
                 with torch.no_grad():
-                    alphas = torch.sigmoid(model.alpha.weight).cpu()
-                    f.write(f"Alpha Statistics:\n")
-                    f.write(f"  Mean: {alphas.mean().item():.4f}, ")
-                    f.write(f"Std: {alphas.std().item():.4f}, ")
-                    f.write(f"Min: {alphas.min().item():.4f}, ")
-                    f.write(f"Max: {alphas.max().item():.4f}\n")
-                    static_count = (alphas < 0.3).sum().item()
-                    dynamic_count = (alphas > 0.7).sum().item()
-                    f.write(f"  Static (a<0.3): {static_count}/{len(alphas)}, ")
-                    f.write(f"Dynamic (a>0.7): {dynamic_count}/{len(alphas)}\n")
+                    a_r = model.time_encoder.a_r.cpu()
+                    A_r = model.time_encoder.A_r.cpu()
+                    f.write(f"Time Encoder Statistics:\n")
+                    f.write(f"  Beta: {model.beta:.4f}\n")
+                    f.write(f"  Trend (a_r): Mean={a_r.mean().item():.4f}, Std={a_r.std().item():.4f}, ")
+                    f.write(f"Range=[{a_r.min().item():.4f}, {a_r.max().item():.4f}]\n")
+                    f.write(f"  Amplitude (A_r): Mean={A_r.mean().item():.4f}, Std={A_r.std().item():.4f}, ")
+                    f.write(f"Range=[{A_r.min().item():.4f}, {A_r.max().item():.4f}]\n")
             
             if dataset.has_intervals():
                 f.write(f"Valid: {valid}\n")

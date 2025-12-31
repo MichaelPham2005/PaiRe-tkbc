@@ -472,7 +472,7 @@ class ContinuousTimeEmbedding(nn.Module):
         self.k = dim // 2
         
         # W and b for each frequency component
-        self.W = nn.Parameter(torch.randn(self.k) * 0.01)
+        self.W = nn.Parameter(torch.randn(self.k) * 10.0)
         self.b = nn.Parameter(torch.zeros(self.k))
         
         # Linear layer to project Fourier features to embedding dimension

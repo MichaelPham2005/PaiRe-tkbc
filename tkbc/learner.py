@@ -57,8 +57,8 @@ parser.add_argument(
     help="Timestamp regularizer strength"
 )
 parser.add_argument(
-    '--smoothness_reg', default=0., type=float,
-    help="Continuity smoothness regularizer for W and b (ContinuousPairRE only)"
+    '--smoothness_reg', default=0.0, type=float,
+    help="Continuity smoothness regularizer for W and b (ContinuousPairRE only) - DISABLED by default"
 )
 parser.add_argument(
     '--alpha_reg', default=0., type=float,

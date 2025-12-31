@@ -543,6 +543,11 @@ class RelationConditionedTimeEncoder(nn.Module):
         # Project: m = tanh(W_proj @ z + b_proj)
         m = torch.tanh(z @ self.W_proj.t() + self.b_proj)  # (batch, dim)
         
+        # CRITICAL FIX: Center time embeddings to prevent bias
+        # Without this, m tends to have non-zero mean (observed: 0.8046)
+        # This causes gate to be constantly shifted, not time-dependent
+        m = m - m.mean(dim=0, keepdim=True)  # Zero-mean per dimension
+        
         return m
 
 

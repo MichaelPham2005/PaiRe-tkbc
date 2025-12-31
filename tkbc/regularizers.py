@@ -51,6 +51,39 @@ class ContinuousTimeLambda3(Regularizer):
         return norm / factor.shape[0]
 
 
+class TimeParameterRegularizer(Regularizer):
+    """
+    Light regularization on relation-conditioned time parameters (a_r, A_r).
+    Does NOT regularize output m_r(t) directly to avoid collapse.
+    
+    L_time_param = weight * (||a_r||_2^2 + ||A_r||_2^2)
+    """
+    def __init__(self, weight: float):
+        super(TimeParameterRegularizer, self).__init__()
+        self.weight = weight
+    
+    def forward(self, a_r: torch.Tensor, A_r: torch.Tensor):
+        """
+        Regularize trend and amplitude parameters.
+        
+        Args:
+            a_r: Trend parameters, shape (n_relations,)
+            A_r: Amplitude parameters, shape (n_relations, K)
+        Returns:
+            Regularization loss (scalar)
+        """
+        if self.weight == 0:
+            return torch.tensor(0.0)
+        
+        trend_reg = torch.sum(a_r ** 2)
+        amplitude_reg = torch.sum(A_r ** 2)
+        
+        return self.weight * (trend_reg + amplitude_reg)
+
+
+# OLD REGULARIZERS - NOT USED IN NEW MODEL
+# Kept for compatibility with old checkpoints only
+
 class ContinuitySmoothness(Regularizer):
     """
     Continuity regularizer for Fourier-based time embeddings.

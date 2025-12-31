@@ -463,70 +463,104 @@ class TNTComplEx(TKBCModel):
         ], 1)
 
 
-class ContinuousTimeEmbedding(nn.Module):
-    """Fourier-based time embedding: m = Linear([cos(W₁t+b₁), sin(W₁t+b₁), ..., cos(Wₖt+bₖ), sin(Wₖt+bₖ)])"""
-    def __init__(self, dim: int):
-        super(ContinuousTimeEmbedding, self).__init__()
-        self.dim = dim
-        # k is number of frequencies (usually k = d/2)
-        self.k = dim // 2
-        
-        # W and b for each frequency component
-        self.W = nn.Parameter(torch.randn(self.k) * 10.0)
-        self.b = nn.Parameter(torch.zeros(self.k))
-        
-        # Linear layer to project Fourier features to embedding dimension
-        # Input: 2k (cos and sin for each frequency)
-        # Output: d (embedding dimension)
-        self.linear = nn.Linear(2 * self.k, dim, bias=False)
+class RelationConditionedTimeEncoder(nn.Module):
+    """
+    Relation-conditioned continuous time encoder.
+    Each relation has its own temporal dynamics: trend (a_r), amplitude (A_r), phase (P_r).
+    Global frequencies (omega) are shared across relations.
     
-    def forward(self, t: torch.Tensor, interval: bool = False):
+    Formula:
+        z_r(tau) = [a_r * tau, A_r * sin(omega * tau + P_r)]
+        m_r(tau) = tanh(W_proj @ z_r + b_proj)
+    """
+    def __init__(self, n_relations: int, dim: int, K: int = 16):
         """
-        Compute Fourier-based time embedding.
+        Args:
+            n_relations: Number of relations
+            dim: Embedding dimension
+            K: Number of frequencies (default 16)
+        """
+        super(RelationConditionedTimeEncoder, self).__init__()
+        self.n_relations = n_relations
+        self.dim = dim
+        self.K = K
+        
+        # Per-relation parameters
+        # Trend: a_r ∈ R for each relation
+        self.a_r = nn.Parameter(torch.randn(n_relations) * 0.01)
+        
+        # Amplitude: A_r ∈ R^K for each relation
+        self.A_r = nn.Parameter(torch.randn(n_relations, K) * 0.1)
+        
+        # Phase: P_r ∈ R^K for each relation
+        self.P_r = nn.Parameter(torch.rand(n_relations, K) * 2 * np.pi - np.pi)  # Uniform[-π, π]
+        
+        # Global frequencies: omega ∈ R^K (shared across all relations)
+        # Initialize with log-spaced frequencies for better coverage
+        omega_init = torch.logspace(0, np.log10(10), K)  # [1, ..., 10]
+        self.omega = nn.Parameter(omega_init)
+        
+        # Projection layer: (1 + K) -> dim
+        self.W_proj = nn.Parameter(torch.empty(dim, 1 + K))
+        self.b_proj = nn.Parameter(torch.zeros(dim))
+        
+        # Xavier initialization for projection with 3x scale to amplify time signal
+        nn.init.xavier_uniform_(self.W_proj)
+        self.W_proj.data *= 3.0
+    
+    def forward(self, rel_id: torch.Tensor, tau: torch.Tensor):
+        """
+        Compute relation-conditioned time embedding.
         
         Args:
-            t: Normalized timestamps in [-1, 1]
-               - If interval=False: (batch,) tensor of point timestamps
-               - If interval=True: (batch, 2) tensor with [begin, end] timestamps
-            interval: Whether t represents intervals or points
+            rel_id: (batch,) relation indices
+            tau: (batch,) normalized continuous timestamps in [0, 1]
+        
         Returns:
-            m: (batch, dim) Fourier-based time embedding
+            m: (batch, dim) time embedding
         """
-        if interval and t.dim() == 2 and t.shape[1] == 2:
-            # Handle interval: use midpoint of [begin, end]
-            t_begin = t[:, 0]  # (batch,)
-            t_end = t[:, 1]    # (batch,)
-            t_mid = (t_begin + t_end) / 2.0  # (batch,)
-            t_scalar = t_mid
-        else:
-            # Handle point timestamp
-            if t.dim() == 2:
-                t_scalar = t.squeeze(-1)  # (batch,)
-            else:
-                t_scalar = t  # (batch,)
+        batch_size = rel_id.shape[0]
         
-        # Compute phase: W_i * t + b_i for each frequency
-        phase = t_scalar.unsqueeze(-1) * self.W + self.b  # (batch, k)
+        # Lookup per-relation parameters
+        a = self.a_r[rel_id]  # (batch,)
+        A = self.A_r[rel_id]  # (batch, K)
+        P = self.P_r[rel_id]  # (batch, K)
         
-        # Compute cos and sin for each frequency
-        cos_features = torch.cos(phase)  # (batch, k)
-        sin_features = torch.sin(phase)  # (batch, k)
+        # Compute trend: z_0 = a_r * tau
+        z_trend = a * tau  # (batch,)
         
-        # Concatenate: [cos(W₁t+b₁), sin(W₁t+b₁), ..., cos(Wₖt+bₖ), sin(Wₖt+bₖ)]
-        fourier_features = torch.cat([cos_features, sin_features], dim=-1)  # (batch, 2k)
+        # Compute periodic: z_k = A_r * sin(omega_k * tau + P_r)
+        # tau: (batch,) -> (batch, 1)
+        # omega: (K,) -> (1, K)
+        # Result: (batch, K)
+        phase = self.omega.unsqueeze(0) * tau.unsqueeze(1) + P  # (batch, K)
+        z_periodic = A * torch.sin(phase)  # (batch, K)
         
-        # Linear projection to embedding dimension
-        m = self.linear(fourier_features)  # (batch, dim)
+        # Concatenate: [z_trend, z_periodic]
+        z = torch.cat([z_trend.unsqueeze(1), z_periodic], dim=1)  # (batch, 1+K)
+        
+        # Project: m = tanh(W_proj @ z + b_proj)
+        m = torch.tanh(z @ self.W_proj.t() + self.b_proj)  # (batch, dim)
         
         return m
 
 
 class ContinuousPairRE(TKBCModel):
-    """Continuous-time PairRE with relation-wise temporal gating"""
-    def __init__(self, sizes: Tuple[int, int, int, int], rank: int, init_size: float = 1e-3):
+    """
+    Continuous-time PairRE with Relation-Conditioned Time Encoding and Residual Gate.
+    
+    Key changes from old version:
+    - NO alpha gating (no mixing with vector 1)
+    - Residual gate: g_r(tau) = 1 + beta * tanh(m_r(tau))
+    - Relation-conditioned time encoder with trend + periodic components
+    """
+    def __init__(self, sizes: Tuple[int, int, int, int], rank: int, 
+                 init_size: float = 0.1, K: int = 16, beta: float = 0.5):
         super(ContinuousPairRE, self).__init__()
         self.sizes = sizes
         self.rank = rank
+        self.K = K
+        self.beta = beta
         
         # Entity embeddings
         self.entity_embeddings = nn.Embedding(sizes[0], rank, sparse=True)
@@ -538,44 +572,66 @@ class ContinuousPairRE(TKBCModel):
         self.relation_head.weight.data *= init_size
         self.relation_tail.weight.data *= init_size
         
-        # Continuous time embedding module
-        self.time_encoder = ContinuousTimeEmbedding(rank)
-        
-        # Relation-wise temporal gating parameter (alpha)
-        # alpha close to 0 = static, alpha close to 1 = dynamic
-        self.alpha = nn.Embedding(sizes[1], 1)
-        nn.init.constant_(self.alpha.weight, 0.5)  # sigmoid(0.5) ≈ 0.62 (bias towards dynamic)
+        # Relation-conditioned time encoder
+        self.time_encoder = RelationConditionedTimeEncoder(
+            n_relations=sizes[1], 
+            dim=rank, 
+            K=K
+        )
     
     @staticmethod
     def has_time():
         return True
     
+    def residual_gate(self, m: torch.Tensor):
+        """
+        Compute residual gate: g = 1 + beta * tanh(m)
+        
+        Args:
+            m: (batch, rank) time embedding
+        Returns:
+            g: (batch, rank) gate values (always > 0 if beta < 1)
+        """
+        return 1.0 + self.beta * torch.tanh(m)
+    
     def score(self, x: torch.Tensor):
+        """
+        Score a batch of (h, r, t, tau) quadruples.
+        
+        Args:
+            x: (batch, 4) tensor [head_id, rel_id, tail_id, tau]
+        Returns:
+            scores: (batch,) L1-norm based scores
+        """
         h = self.entity_embeddings(x[:, 0].long())
         r_h = self.relation_head(x[:, 1].long())
         t = self.entity_embeddings(x[:, 2].long())
         r_t = self.relation_tail(x[:, 1].long())
         
-        # Check if input has interval (5 columns) or point (4 columns)
-        if x.shape[1] >= 5:
-            # Interval mode: [h, r, t, begin, end]
-            time_begin = x[:, 3].float()
-            time_end = x[:, 4].float()
-            time_interval = torch.stack([time_begin, time_end], dim=1)  # (batch, 2)
-            m_fourier = self.time_encoder(time_interval, interval=True)
-        else:
-            # Point mode: [h, r, t, time]
-            time_continuous = x[:, 3].float()
-            m_fourier = self.time_encoder(time_continuous, interval=False)
+        # Get relation-conditioned time embedding
+        rel_id = x[:, 1].long()
+        tau = x[:, 3].float()
+        m = self.time_encoder(rel_id, tau)
         
-        alpha = torch.sigmoid(self.alpha(x[:, 1].long()))
-        gate = alpha * m_fourier + (1 - alpha) * torch.ones_like(m_fourier)
+        # Compute residual gate
+        gate = self.residual_gate(m)
         
+        # PairRE interaction with time gate
         interaction = (h * r_h - t * r_t) * gate
         score = -torch.norm(interaction, p=1, dim=-1)
         return score
     
     def forward(self, x: torch.Tensor):
+        """
+        Forward pass for 1-vs-All prediction.
+        
+        Args:
+            x: (batch, 4) tensor [head_id, rel_id, tail_id, tau]
+        Returns:
+            scores: (batch, n_entities) scores for all entities
+            factors: tuple of embeddings for regularization
+            time_emb: (batch, rank) time embeddings
+        """
         batch_size = x.shape[0]
         
         # Extract components
@@ -583,33 +639,18 @@ class ContinuousPairRE(TKBCModel):
         r_h = self.relation_head(x[:, 1].long())     # (batch, rank)
         r_t = self.relation_tail(x[:, 1].long())     # (batch, rank)
         
-        # Get continuous time embedding (handle both point and interval)
-        if x.shape[1] >= 5:
-            # Interval mode: [h, r, t, begin, end]
-            time_begin = x[:, 3].float()
-            time_end = x[:, 4].float()
-            time_interval = torch.stack([time_begin, time_end], dim=1)  # (batch, 2)
-            m_fourier = self.time_encoder(time_interval, interval=True)
-        else:
-            # Point mode: [h, r, t, time]
-            time_continuous = x[:, 3].float()
-            m_fourier = self.time_encoder(time_continuous, interval=False)
+        # Get relation-conditioned time embedding
+        rel_id = x[:, 1].long()
+        tau = x[:, 3].float()
+        m = self.time_encoder(rel_id, tau)  # (batch, rank)
         
-        # Get relation-specific gating coefficient
-        alpha = torch.sigmoid(self.alpha(x[:, 1].long()))
-        
-        # Compute gated time modulation: G(m,r) = alpha_r * m_fourier + (1 - alpha_r) * 1
-        gate = alpha * m_fourier + (1 - alpha) * torch.ones_like(m_fourier)
+        # Compute residual gate
+        gate = self.residual_gate(m)  # (batch, rank)
         
         # Get all entity embeddings
         all_entities = self.entity_embeddings.weight  # (n_entities, rank)
         
         # VECTORIZED: Compute scores for all entities at once
-        # h * r_h: (batch, rank)
-        # all_entities: (n_entities, rank)
-        # r_t: (batch, rank)
-        # gate: (batch, rank)
-        
         # Expand dimensions for broadcasting
         h_r_h = (h * r_h).unsqueeze(1)  # (batch, 1, rank)
         r_t_expanded = r_t.unsqueeze(1)  # (batch, 1, rank)
@@ -630,7 +671,7 @@ class ContinuousPairRE(TKBCModel):
             torch.sqrt(r_h ** 2 + r_t ** 2 + 1e-10),
             torch.sqrt(t ** 2 + 1e-10)
         )
-        return scores, factors, m_fourier
+        return scores, factors, m
     
     def get_ranking(self, queries: torch.Tensor, filters: Dict[Tuple[int, int, int], List[int]],
                     batch_size: int = 1000, chunk_size: int = -1, timestamp_ids: torch.Tensor = None):
@@ -681,43 +722,30 @@ class ContinuousPairRE(TKBCModel):
         r_h = self.relation_head(x[:, 1].long())     # (batch, rank)
         t = self.entity_embeddings(x[:, 2].long())   # (batch, rank)
         r_t = self.relation_tail(x[:, 1].long())     # (batch, rank)
+        rel_id = x[:, 1].long()  # (batch,)
         
-        # Get all normalized timestamps
-        # Assuming dataset provides ts_normalized_array or we compute it
-        # For now, create linearly spaced timestamps in [-1, 1]
-        n_timestamps = self.sizes[3]  # Number of timestamps in dataset
-        all_times = torch.linspace(-1, 1, n_timestamps).to(h.device)  # (n_timestamps,)
+        # Get all normalized timestamps in [0, 1]
+        n_timestamps = self.sizes[3]
+        all_taus = torch.linspace(0, 1, n_timestamps).to(h.device)  # (n_timestamps,)
         
-        # Compute time embeddings for all timestamps
-        all_m_fourier = self.time_encoder(all_times)  # (n_timestamps, rank)
+        # Expand rel_id for all timestamps
+        # rel_id: (batch,) -> (batch, n_timestamps)
+        rel_id_exp = rel_id.unsqueeze(1).expand(-1, n_timestamps).reshape(-1)  # (batch * n_timestamps,)
+        all_taus_exp = all_taus.unsqueeze(0).expand(batch_size, -1).reshape(-1)  # (batch * n_timestamps,)
         
-        # Get relation-specific alpha
-        alpha = torch.sigmoid(self.alpha(x[:, 1].long()))  # (batch, 1)
+        # Compute time embeddings for all (relation, time) pairs
+        all_m = self.time_encoder(rel_id_exp, all_taus_exp)  # (batch * n_timestamps, rank)
+        all_m = all_m.view(batch_size, n_timestamps, self.rank)  # (batch, n_timestamps, rank)
         
-        # Expand for broadcasting
-        # h, r_h, t, r_t: (batch, rank)
-        # all_m_fourier: (n_timestamps, rank)
-        # alpha: (batch, 1)
+        # Compute gates
+        all_gates = self.residual_gate(all_m)  # (batch, n_timestamps, rank)
         
         # Compute interaction for each timestamp
-        h_r_h = h * r_h  # (batch, rank)
-        t_r_t = t * r_t  # (batch, rank)
+        h_r_h = (h * r_h).unsqueeze(1)  # (batch, 1, rank)
+        t_r_t = (t * r_t).unsqueeze(1)  # (batch, 1, rank)
         
-        # Expand dimensions
-        h_r_h_exp = h_r_h.unsqueeze(1)  # (batch, 1, rank)
-        t_r_t_exp = t_r_t.unsqueeze(1)  # (batch, 1, rank)
-        alpha_exp = alpha.unsqueeze(1)  # (batch, 1, 1)
-        all_m_exp = all_m_fourier.unsqueeze(0)  # (1, n_timestamps, rank)
-        
-        # Compute gate for all timestamps: G(m,r) = alpha * m + (1-alpha) * 1
-        # Broadcasting: (batch, 1, 1) * (1, n_timestamps, rank) + (batch, 1, 1)
-        gate_all = alpha_exp * all_m_exp + (1 - alpha_exp) * torch.ones_like(all_m_exp)
-        # gate_all: (batch, n_timestamps, rank)
-        
-        # Compute interaction: (h * r_h - t * r_t) * gate
-        # (batch, 1, rank) - (batch, 1, rank) = (batch, 1, rank)
-        # Then broadcast with gate_all: (batch, n_timestamps, rank)
-        interaction = (h_r_h_exp - t_r_t_exp) * gate_all
+        # interaction: (h * r_h - t * r_t) * gate
+        interaction = (h_r_h - t_r_t) * all_gates  # (batch, n_timestamps, rank)
         
         # Compute scores: -||interaction||_1
         scores = -torch.norm(interaction, p=1, dim=2)  # (batch, n_timestamps)
@@ -735,11 +763,10 @@ class ContinuousPairRE(TKBCModel):
         h = self.entity_embeddings(queries[:, 0].long())
         r_h = self.relation_head(queries[:, 1].long())
         
-        time_continuous = queries[:, 3].float()
-        m_fourier = self.time_encoder(time_continuous)
-        
-        alpha = torch.sigmoid(self.alpha(queries[:, 1].long()))
-        gate = alpha * m_fourier + (1 - alpha) * torch.ones_like(m_fourier)
+        rel_id = queries[:, 1].long()
+        tau = queries[:, 3].float()
+        m = self.time_encoder(rel_id, tau)
+        gate = self.residual_gate(m)
         
         return h * r_h * gate
 

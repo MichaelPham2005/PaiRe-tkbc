@@ -57,12 +57,24 @@ parser.add_argument(
     help="Timestamp regularizer strength"
 )
 parser.add_argument(
-    '--smoothness_reg', default=0.0, type=float,
-    help="Continuity smoothness regularizer for W and b (ContinuousPairRE only) - DISABLED by default"
+    '--time_param_reg', default=0., type=float,
+    help="Time parameter regularizer for a_r and A_r (ContinuousPairRE only)"
 )
 parser.add_argument(
-    '--alpha_reg', default=0., type=float,
-    help="Alpha polarization regularizer (push toward 0 or 1, ContinuousPairRE only)"
+    '--time_discrimination_weight', default=0.1, type=float,
+    help="Weight for time discrimination loss (ContinuousPairRE only)"
+)
+parser.add_argument(
+    '--K_frequencies', default=16, type=int,
+    help="Number of frequency components for relation-conditioned time encoder (ContinuousPairRE only)"
+)
+parser.add_argument(
+    '--beta', default=0.5, type=float,
+    help="Beta parameter for residual gate (ContinuousPairRE only)"
+)
+parser.add_argument(
+    '--time_scale', default=1.0, type=float,
+    help="Time normalization scale (1.0 for [0,1], 10.0 for [0,10])"
 )
 parser.add_argument(
     '--loss', default='cross_entropy', choices=['cross_entropy', 'self_adversarial'],
@@ -93,7 +105,7 @@ model = {
     'ComplEx': ComplEx(sizes, args.rank),
     'TComplEx': TComplEx(sizes, args.rank, no_time_emb=args.no_time_emb),
     'TNTComplEx': TNTComplEx(sizes, args.rank, no_time_emb=args.no_time_emb),
-    'ContinuousPairRE': ContinuousPairRE(sizes, args.rank),
+    'ContinuousPairRE': ContinuousPairRE(sizes, args.rank, K=args.K_frequencies, beta=args.beta),
 }[args.model]
 model = model.cuda()
 
@@ -130,8 +142,11 @@ print(f"Validation frequency: every {args.valid_freq} epochs")
 print(f"Embedding regularization (N3): {args.emb_reg}")
 print(f"Time regularization: {args.time_reg}")
 if args.model == 'ContinuousPairRE':
-    print(f"Smoothness regularization (W/b): {args.smoothness_reg}")
-    print(f"Alpha polarization regularization: {args.alpha_reg}")
+    print(f"K frequencies: {args.K_frequencies}")
+    print(f"Beta (residual gate): {args.beta}")
+    print(f"Time parameter regularization: {args.time_param_reg}")
+    print(f"Time discrimination weight: {args.time_discrimination_weight}")
+    print(f"Time scale: [0, {args.time_scale}]")
 print(f"Checkpoint directory: {checkpoint_dir}")
 print("="*70 + "\n")
 
@@ -140,10 +155,9 @@ opt = optim.Adagrad(model.parameters(), lr=args.learning_rate)
 emb_reg = N3(args.emb_reg)
 # Use ContinuousTimeLambda3 for ContinuousPairRE, Lambda3 for others
 time_reg = ContinuousTimeLambda3(args.time_reg) if args.model == 'ContinuousPairRE' else Lambda3(args.time_reg)
-# Add smoothness regularizer for continuous time models
-smoothness_reg = ContinuitySmoothness(args.smoothness_reg) if args.model == 'ContinuousPairRE' else None
-# Add alpha polarization regularizer
-alpha_reg = AlphaPolarization(args.alpha_reg) if args.model == 'ContinuousPairRE' else None
+# Add time parameter regularizer for continuous time models
+from regularizers import TimeParameterRegularizer
+time_param_reg = TimeParameterRegularizer(args.time_param_reg) if args.model == 'ContinuousPairRE' else None
 
 # Track best validation MRR for saving best model
 best_valid_mrr = 0.0
@@ -168,11 +182,11 @@ for epoch in range(args.max_epochs):
         optimizer = ContinuousTimeOptimizer(
             model, emb_reg, time_reg, opt, dataset,
             batch_size=args.batch_size,
-            smoothness_regularizer=smoothness_reg,
-            alpha_regularizer=alpha_reg,
+            time_param_regularizer=time_param_reg,
             loss_type=args.loss,
             margin=args.margin,
-            adversarial_temperature=args.adversarial_temperature
+            adversarial_temperature=args.adversarial_temperature,
+            time_discrimination_weight=args.time_discrimination_weight
         )
         optimizer.epoch(examples)
     else:

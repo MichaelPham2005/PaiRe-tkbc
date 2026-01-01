@@ -553,12 +553,12 @@ class RelationConditionedTimeEncoder(nn.Module):
 
 class ContinuousPairRE(TKBCModel):
     """
-    Continuous-time PairRE with Relation-Conditioned Time Encoding and Residual Gate.
+    Continuous-time PairRE with Relation-Conditioned Time Encoding.
     
-    Key changes from old version:
-    - NO alpha gating (no mixing with vector 1)
-    - Residual gate: g_r(tau) = 1 + beta * tanh(m_r(tau))
+    Key features:
+    - Direct multiplicative time modulation: r_h(t) = r_h * m(t), r_t(t) = r_t * m(t)
     - Relation-conditioned time encoder with trend + periodic components
+    - Time embedding m(t) is learned per-relation and applied element-wise
     """
     def __init__(self, sizes: Tuple[int, int, int, int], rank: int, 
                  init_size: float = 0.1, K: int = 16, beta: float = 0.5):
@@ -619,11 +619,12 @@ class ContinuousPairRE(TKBCModel):
         tau = x[:, 3].float()
         m = self.time_encoder(rel_id, tau)
         
-        # Compute residual gate
-        gate = self.residual_gate(m)
+        # Apply time embedding directly to relation projections
+        r_h_time = r_h * m
+        r_t_time = r_t * m
         
-        # PairRE interaction with time gate
-        interaction = (h * r_h - t * r_t) * gate
+        # PairRE interaction with time-modulated relations
+        interaction = h * r_h_time - t * r_t_time
         score = -torch.norm(interaction, p=1, dim=-1)
         return score
     
@@ -650,22 +651,22 @@ class ContinuousPairRE(TKBCModel):
         tau = x[:, 3].float()
         m = self.time_encoder(rel_id, tau)  # (batch, rank)
         
-        # Compute residual gate
-        gate = self.residual_gate(m)  # (batch, rank)
+        # Apply time embedding directly to relation projections
+        r_h_time = r_h * m  # (batch, rank)
+        r_t_time = r_t * m  # (batch, rank)
         
         # Get all entity embeddings
         all_entities = self.entity_embeddings.weight  # (n_entities, rank)
         
         # VECTORIZED: Compute scores for all entities at once
         # Expand dimensions for broadcasting
-        h_r_h = (h * r_h).unsqueeze(1)  # (batch, 1, rank)
-        r_t_expanded = r_t.unsqueeze(1)  # (batch, 1, rank)
-        gate_expanded = gate.unsqueeze(1)  # (batch, 1, rank)
+        h_r_h_time = (h * r_h_time).unsqueeze(1)  # (batch, 1, rank)
+        r_t_time_expanded = r_t_time.unsqueeze(1)  # (batch, 1, rank)
         all_entities_expanded = all_entities.unsqueeze(0)  # (1, n_entities, rank)
         
-        # Compute interaction: (h * r_h - entity * r_t) * gate
+        # Compute interaction: h * r_h_time - entity * r_t_time
         # Broadcasting: (batch, 1, rank) - (1, n_entities, rank) * (batch, 1, rank) -> (batch, n_entities, rank)
-        interaction = (h_r_h - all_entities_expanded * r_t_expanded) * gate_expanded
+        interaction = h_r_h_time - all_entities_expanded * r_t_time_expanded
         
         # Compute L1 norm along rank dimension
         scores = -torch.norm(interaction, p=1, dim=2)  # (batch, n_entities)
@@ -743,15 +744,18 @@ class ContinuousPairRE(TKBCModel):
         all_m = self.time_encoder(rel_id_exp, all_taus_exp)  # (batch * n_timestamps, rank)
         all_m = all_m.view(batch_size, n_timestamps, self.rank)  # (batch, n_timestamps, rank)
         
-        # Compute gates
-        all_gates = self.residual_gate(all_m)  # (batch, n_timestamps, rank)
+        # Apply time embeddings directly to relation projections
+        r_h_exp = r_h.unsqueeze(1)  # (batch, 1, rank)
+        r_t_exp = r_t.unsqueeze(1)  # (batch, 1, rank)
+        r_h_time = r_h_exp * all_m  # (batch, n_timestamps, rank)
+        r_t_time = r_t_exp * all_m  # (batch, n_timestamps, rank)
         
         # Compute interaction for each timestamp
-        h_r_h = (h * r_h).unsqueeze(1)  # (batch, 1, rank)
-        t_r_t = (t * r_t).unsqueeze(1)  # (batch, 1, rank)
+        h_exp = h.unsqueeze(1)  # (batch, 1, rank)
+        t_exp = t.unsqueeze(1)  # (batch, 1, rank)
         
-        # interaction: (h * r_h - t * r_t) * gate
-        interaction = (h_r_h - t_r_t) * all_gates  # (batch, n_timestamps, rank)
+        # interaction: h * r_h_time - t * r_t_time
+        interaction = h_exp * r_h_time - t_exp * r_t_time  # (batch, n_timestamps, rank)
         
         # Compute scores: -||interaction||_1
         scores = -torch.norm(interaction, p=1, dim=2)  # (batch, n_timestamps)
@@ -772,7 +776,8 @@ class ContinuousPairRE(TKBCModel):
         rel_id = queries[:, 1].long()
         tau = queries[:, 3].float()
         m = self.time_encoder(rel_id, tau)
-        gate = self.residual_gate(m)
         
-        return h * r_h * gate
+        # Apply time embedding to r_h, then compute query
+        r_h_time = r_h * m
+        return h * r_h_time
 

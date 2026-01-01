@@ -61,6 +61,10 @@ parser.add_argument(
     help="Time parameter regularizer for a_r and A_r (ContinuousPairRE only)"
 )
 parser.add_argument(
+    '--smoothness_reg', default=0., type=float,
+    help="Temporal smoothness regularizer strength (ContinuousPairRE only)"
+)
+parser.add_argument(
     '--time_discrimination_weight', default=0.1, type=float,
     help="Weight for time discrimination loss (ContinuousPairRE only)"
 )

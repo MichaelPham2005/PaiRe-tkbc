@@ -461,7 +461,11 @@ class GEPairREOptimizer(object):
         
         return neg_tau, neg_time_ids
     
-    def epoch(self, examples: torch.LongTensor):
+    def epoch(self, examples: torch.LongTensor, epoch_num: int = None):
+        # Update current epoch if provided (for when optimizer is recreated each epoch)
+        if epoch_num is not None:
+            self.current_epoch = epoch_num
+        
         # Check if we should transition from warm-up to dynamic
         if self.current_epoch == self.warmup_epochs:
             self._unfreeze_gaussian_params()

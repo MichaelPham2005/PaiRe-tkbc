@@ -224,7 +224,7 @@ for epoch in range(args.max_epochs):
             warmup_epochs=args.warmup_epochs,
             max_lambda_time=args.max_lambda_time
         )
-        optimizer.epoch(examples)
+        optimizer.epoch(examples, epoch_num=epoch)
     elif args.model == 'ContinuousPairRE':
         # Use continuous time optimizer for ContinuousPairRE
         optimizer = ContinuousTimeOptimizer(

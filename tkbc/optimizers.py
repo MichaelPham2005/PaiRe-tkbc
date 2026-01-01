@@ -392,8 +392,8 @@ class GEPairREOptimizer(object):
         if not hasattr(dataset, 'ts_normalized') or dataset.ts_normalized is None:
             raise ValueError("Dataset must have continuous time mappings loaded")
         
-        # Freeze Gaussian parameters initially
-        self._freeze_gaussian_params()
+        # DON'T freeze here - let epoch() handle freeze/unfreeze based on stage
+        # This allows optimizer to be recreated each epoch without breaking training
     
     def _freeze_gaussian_params(self):
         """Freeze Gaussian parameters (A, mu, s) during warm-up."""
@@ -466,10 +466,15 @@ class GEPairREOptimizer(object):
         if epoch_num is not None:
             self.current_epoch = epoch_num
         
-        # Check if we should transition from warm-up to dynamic
-        if self.current_epoch == self.warmup_epochs:
+        # Freeze/unfreeze based on current stage
+        if self.current_epoch < self.warmup_epochs:
+            # Warm-up stage: freeze Gaussian parameters
+            self._freeze_gaussian_params()
+        else:
+            # Dynamic stage: unfreeze Gaussian parameters
             self._unfreeze_gaussian_params()
-            if self.verbose:
+            # Print transition message only once
+            if self.current_epoch == self.warmup_epochs and self.verbose:
                 print(f"\n[Epoch {self.current_epoch + 1}] TRANSITIONING TO DYNAMIC TRAINING")
                 print(f"  - Unfroze Gaussian parameters (A, μ, s)")
                 print(f"  - Enabling temporal discrimination loss")

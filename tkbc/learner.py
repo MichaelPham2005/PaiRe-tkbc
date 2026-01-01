@@ -10,7 +10,7 @@ import json
 from pathlib import Path
 
 from datasets import TemporalDataset
-from optimizers import TKBCOptimizer, IKBCOptimizer, ContinuousTimeOptimizer
+from optimizers import TKBCOptimizer, IKBCOptimizer, ContinuousTimeOptimizer, MarginBasedContinuousTimeOptimizer
 from models import ComplEx, TComplEx, TNTComplEx, ContinuousPairRE
 from regularizers import N3, Lambda3, ContinuousTimeLambda3, ContinuitySmoothness
 
@@ -59,6 +59,22 @@ parser.add_argument(
 parser.add_argument(
     '--smoothness_reg', default=0., type=float,
     help="Continuity smoothness regularizer for W and b (ContinuousPairRE only)"
+)
+parser.add_argument(
+    '--use_margin_loss', default=False, action="store_true",
+    help="Use margin-based loss (paper version) instead of CrossEntropy for ContinuousPairRE"
+)
+parser.add_argument(
+    '--gamma', default=9.0, type=float,
+    help="Margin parameter for margin-based loss"
+)
+parser.add_argument(
+    '--num_neg', default=64, type=int,
+    help="Number of negative samples per positive (for margin-based loss)"
+)
+parser.add_argument(
+    '--adversarial_temp', default=1.0, type=float,
+    help="Temperature for self-adversarial negative sampling (0 = uniform)"
 )
 parser.add_argument(
     '--no_time_emb', default=False, action="store_true",
@@ -115,6 +131,11 @@ print(f"Embedding regularization (N3): {args.emb_reg}")
 print(f"Time regularization: {args.time_reg}")
 if args.model == 'ContinuousPairRE':
     print(f"Smoothness regularization (W/b): {args.smoothness_reg}")
+    print(f"Use margin-based loss: {args.use_margin_loss}")
+    if args.use_margin_loss:
+        print(f"  Margin (γ): {args.gamma}")
+        print(f"  Negative samples: {args.num_neg}")
+        print(f"  Adversarial temperature: {args.adversarial_temp}")
 print(f"Checkpoint directory: {checkpoint_dir}")
 print("="*70 + "\n")
 
@@ -145,12 +166,22 @@ for epoch in range(args.max_epochs):
         )
         optimizer.epoch(examples)
     elif args.model == 'ContinuousPairRE':
-        # Use continuous time optimizer for ContinuousPairRE
-        optimizer = ContinuousTimeOptimizer(
-            model, emb_reg, time_reg, opt, dataset,
-            batch_size=args.batch_size,
-            smoothness_regularizer=smoothness_reg
-        )
+        # Use margin-based optimizer or standard CrossEntropy optimizer
+        if args.use_margin_loss:
+            optimizer = MarginBasedContinuousTimeOptimizer(
+                model, emb_reg, time_reg, opt, dataset,
+                batch_size=args.batch_size,
+                smoothness_regularizer=smoothness_reg,
+                gamma=args.gamma,
+                num_neg=args.num_neg,
+                adversarial_temp=args.adversarial_temp
+            )
+        else:
+            optimizer = ContinuousTimeOptimizer(
+                model, emb_reg, time_reg, opt, dataset,
+                batch_size=args.batch_size,
+                smoothness_regularizer=smoothness_reg
+            )
         optimizer.epoch(examples)
     else:
         optimizer = TKBCOptimizer(

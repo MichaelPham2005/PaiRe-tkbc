@@ -199,3 +199,126 @@ class ContinuousTimeOptimizer(object):
                     cont=f'{l_time.item():.0f}',
                     smooth=f'{l_smooth.item():.4f}'
                 )
+
+
+class MarginBasedContinuousTimeOptimizer(object):
+    """
+    Optimizer with margin-based loss as described in the paper:
+    L = -log(σ(γ - f_r(h,t))) - Σ p(h',r,t') log(σ(f_r(h',t') - γ))
+    
+    This uses self-adversarial negative sampling with margin γ.
+    """
+    def __init__(
+            self, model: TKBCModel,
+            emb_regularizer: Regularizer, temporal_regularizer: Regularizer,
+            optimizer: optim.Optimizer, dataset: TemporalDataset,
+            batch_size: int = 256, verbose: bool = True,
+            smoothness_regularizer: Regularizer = None,
+            gamma: float = 9.0,  # Margin parameter
+            num_neg: int = 64,   # Number of negative samples per positive
+            adversarial_temp: float = 1.0  # Temperature for self-adversarial weighting
+    ):
+        self.model = model
+        self.dataset = dataset
+        self.emb_regularizer = emb_regularizer
+        self.temporal_regularizer = temporal_regularizer
+        self.smoothness_regularizer = smoothness_regularizer
+        self.optimizer = optimizer
+        self.batch_size = batch_size
+        self.verbose = verbose
+        self.gamma = gamma
+        self.num_neg = num_neg
+        self.adversarial_temp = adversarial_temp
+        
+        if not hasattr(dataset, 'ts_normalized') or dataset.ts_normalized is None:
+            raise ValueError("Dataset must have continuous time mappings loaded")
+
+    def epoch(self, examples: torch.LongTensor):
+        actual_examples = examples[torch.randperm(examples.shape[0]), :]
+        
+        with tqdm.tqdm(total=examples.shape[0], unit='ex', disable=not self.verbose) as bar:
+            bar.set_description(f'train loss')
+            b_begin = 0
+            while b_begin < examples.shape[0]:
+                input_batch = actual_examples[
+                    b_begin:b_begin + self.batch_size
+                ]
+                
+                # Convert timestamp IDs to continuous normalized values
+                batch_with_continuous_time = input_batch.clone().float()
+                timestamp_ids = input_batch[:, 3].cpu().numpy()
+                continuous_times = torch.tensor(
+                    [self.dataset.ts_normalized[int(tid)] for tid in timestamp_ids],
+                    dtype=torch.float32
+                )
+                batch_with_continuous_time[:, 3] = continuous_times
+                batch_with_continuous_time = batch_with_continuous_time.cuda()
+                
+                # Compute positive scores: f_r(h, t)
+                positive_score = self.model.score(batch_with_continuous_time)  # (batch_size,)
+                
+                # Positive loss: -log(σ(γ - f_r(h,t)))
+                positive_loss = -torch.log(torch.sigmoid(self.gamma - positive_score) + 1e-10).mean()
+                
+                # Generate negative samples by corrupting tail entities
+                batch_size_actual = batch_with_continuous_time.shape[0]
+                neg_samples = torch.randint(
+                    0, self.dataset.n_entities, 
+                    (batch_size_actual, self.num_neg),
+                    device=batch_with_continuous_time.device
+                )
+                
+                # Expand positive samples for broadcasting
+                pos_expanded = batch_with_continuous_time.unsqueeze(1).expand(-1, self.num_neg, -1)  # (batch, num_neg, 4)
+                neg_batch = pos_expanded.clone()
+                neg_batch[:, :, 2] = neg_samples  # Replace tail with negatives
+                neg_batch = neg_batch.reshape(-1, 4)  # (batch * num_neg, 4)
+                
+                # Compute negative scores: f_r(h, t')
+                negative_scores = self.model.score(neg_batch)  # (batch * num_neg,)
+                negative_scores = negative_scores.reshape(batch_size_actual, self.num_neg)  # (batch, num_neg)
+                
+                # Self-adversarial weighting: p(h', r, t') = exp(α * f_r(h',t')) / Σ exp(α * f_r)
+                # Higher score negatives get higher weight
+                if self.adversarial_temp > 0:
+                    weights = torch.softmax(negative_scores * self.adversarial_temp, dim=1).detach()
+                else:
+                    weights = torch.ones_like(negative_scores) / self.num_neg
+                
+                # Negative loss: -Σ p(h',r,t') log(σ(f_r(h',t') - γ))
+                negative_loss_per_sample = -torch.log(torch.sigmoid(negative_scores - self.gamma) + 1e-10)  # (batch, num_neg)
+                negative_loss = (weights * negative_loss_per_sample).sum(dim=1).mean()
+                
+                # Total loss
+                l_fit = positive_loss + negative_loss
+                
+                # Get factors for regularization
+                _, factors, time = self.model.forward(batch_with_continuous_time)
+                
+                l_reg = self.emb_regularizer.forward(factors)
+                l_time = torch.zeros_like(l_reg)
+                if time is not None:
+                    l_time = self.temporal_regularizer.forward(time)
+                
+                # Add smoothness regularization on W and b
+                l_smooth = torch.zeros_like(l_reg)
+                if self.smoothness_regularizer is not None and hasattr(self.model, 'time_encoder'):
+                    W = self.model.time_encoder.W
+                    b = self.model.time_encoder.b
+                    l_smooth = self.smoothness_regularizer.forward(W, b)
+                
+                l = l_fit + l_reg + l_time + l_smooth
+
+                self.optimizer.zero_grad()
+                l.backward()
+                self.optimizer.step()
+                b_begin += self.batch_size
+                bar.update(input_batch.shape[0])
+                bar.set_postfix(
+                    loss=f'{l_fit.item():.2f}',
+                    pos=f'{positive_loss.item():.2f}',
+                    neg=f'{negative_loss.item():.2f}',
+                    reg=f'{l_reg.item():.2f}',
+                    cont=f'{l_time.item():.2f}',
+                    smooth=f'{l_smooth.item():.4f}'
+                )

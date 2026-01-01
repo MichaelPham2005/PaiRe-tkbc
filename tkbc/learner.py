@@ -10,9 +10,9 @@ import json
 from pathlib import Path
 
 from datasets import TemporalDataset
-from optimizers import TKBCOptimizer, IKBCOptimizer, ContinuousTimeOptimizer
-from models import ComplEx, TComplEx, TNTComplEx, ContinuousPairRE
-from regularizers import N3, Lambda3, ContinuousTimeLambda3, TimeParameterRegularizer
+from optimizers import TKBCOptimizer, IKBCOptimizer, ContinuousTimeOptimizer, GEPairREOptimizer
+from models import ComplEx, TComplEx, TNTComplEx, ContinuousPairRE, GEPairRE
+from regularizers import N3, Lambda3, ContinuousTimeLambda3, TimeParameterRegularizer, AmplitudeDecayRegularizer, WidthPenaltyRegularizer
 
 parser = argparse.ArgumentParser(
     description="Temporal ComplEx"
@@ -22,7 +22,7 @@ parser.add_argument(
     help="Dataset name"
 )
 models = [
-    'ComplEx', 'TComplEx', 'TNTComplEx', 'ContinuousPairRE'
+    'ComplEx', 'TComplEx', 'TNTComplEx', 'ContinuousPairRE', 'GEPairRE'
 ]
 parser.add_argument(
     '--model', choices=models,
@@ -92,12 +92,37 @@ parser.add_argument(
     '--no_time_emb', default=False, action="store_true",
     help="Use a specific embedding for non temporal relations"
 )
+# GE-PairRE specific arguments
+parser.add_argument(
+    '--K_gaussians', default=8, type=int,
+    help="Number of Gaussian pulses per relation (GEPairRE only)"
+)
+parser.add_argument(
+    '--sigma_max', default=0.2, type=float,
+    help="Maximum width for Gaussian pulses (GEPairRE only)"
+)
+parser.add_argument(
+    '--warmup_epochs', default=5, type=int,
+    help="Number of warm-up epochs to freeze Gaussian params (GEPairRE only)"
+)
+parser.add_argument(
+    '--amplitude_reg', default=0.001, type=float,
+    help="Amplitude decay regularization weight (GEPairRE only)"
+)
+parser.add_argument(
+    '--width_reg', default=0.01, type=float,
+    help="Width penalty regularization weight (GEPairRE only)"
+)
+parser.add_argument(
+    '--max_lambda_time', default=1.0, type=float,
+    help="Maximum value for λ_time in dynamic stage (GEPairRE only)"
+)
 
 
 args = parser.parse_args()
 
-# Use continuous time for ContinuousPairRE model
-use_continuous = (args.model == 'ContinuousPairRE')
+# Use continuous time for ContinuousPairRE and GEPairRE models
+use_continuous = (args.model in ['ContinuousPairRE', 'GEPairRE'])
 dataset = TemporalDataset(args.dataset, use_continuous_time=use_continuous)
 
 sizes = dataset.get_shape()
@@ -106,6 +131,7 @@ model = {
     'TComplEx': TComplEx(sizes, args.rank, no_time_emb=args.no_time_emb),
     'TNTComplEx': TNTComplEx(sizes, args.rank, no_time_emb=args.no_time_emb),
     'ContinuousPairRE': ContinuousPairRE(sizes, args.rank, K=args.K_frequencies, beta=args.beta),
+    'GEPairRE': GEPairRE(sizes, args.rank, K=args.K_gaussians, sigma_max=args.sigma_max),
 }[args.model]
 model = model.cuda()
 
@@ -147,6 +173,14 @@ if args.model == 'ContinuousPairRE':
     print(f"Time parameter regularization: {args.time_param_reg}")
     print(f"Time discrimination weight: {args.time_discrimination_weight}")
     print(f"Time scale: [0, {args.time_scale}]")
+elif args.model == 'GEPairRE':
+    print(f"K Gaussians: {args.K_gaussians}")
+    print(f"Sigma max: {args.sigma_max}")
+    print(f"Warmup epochs: {args.warmup_epochs}")
+    print(f"Amplitude regularization: {args.amplitude_reg}")
+    print(f"Width regularization: {args.width_reg}")
+    print(f"Max λ_time: {args.max_lambda_time}")
+    print(f"Margin (hard temporal discrimination): {args.margin}")
 print(f"Checkpoint directory: {checkpoint_dir}")
 print("="*70 + "\n")
 
@@ -158,6 +192,10 @@ time_reg = ContinuousTimeLambda3(args.time_reg) if args.model == 'ContinuousPair
 # Add time parameter regularizer for continuous time models
 from regularizers import TimeParameterRegularizer
 time_param_reg = TimeParameterRegularizer(args.time_param_reg) if args.model == 'ContinuousPairRE' else None
+
+# GE-PairRE specific regularizers
+amplitude_reg = AmplitudeDecayRegularizer(args.amplitude_reg) if args.model == 'GEPairRE' else None
+width_reg = WidthPenaltyRegularizer(args.width_reg, args.sigma_max) if args.model == 'GEPairRE' else None
 
 # Track best validation MRR for saving best model
 best_valid_mrr = 0.0
@@ -175,6 +213,16 @@ for epoch in range(args.max_epochs):
         optimizer = IKBCOptimizer(
             model, emb_reg, time_reg, opt, dataset,
             batch_size=args.batch_size
+        )
+        optimizer.epoch(examples)
+    elif args.model == 'GEPairRE':
+        # Use GE-PairRE optimizer with 2-stage training
+        optimizer = GEPairREOptimizer(
+            model, emb_reg, time_reg, amplitude_reg, width_reg, opt, dataset,
+            batch_size=args.batch_size,
+            margin=args.margin,
+            warmup_epochs=args.warmup_epochs,
+            max_lambda_time=args.max_lambda_time
         )
         optimizer.epoch(examples)
     elif args.model == 'ContinuousPairRE':

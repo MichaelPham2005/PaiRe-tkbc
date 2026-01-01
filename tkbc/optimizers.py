@@ -346,3 +346,219 @@ class ContinuousTimeOptimizer(object):
         
         # Increment epoch counter after processing all batches
         self.current_epoch += 1
+
+
+class GEPairREOptimizer(object):
+    """
+    Optimizer for GE-PairRE (Gaussian Evolution PairRE).
+    
+    Implements 2-stage training:
+    - Stage 1 (Warm-up, epochs 1-5): Freeze Gaussian params, train static only, λ_time = 0
+    - Stage 2 (Dynamic, epochs 6+): Unfreeze Gaussian, enable temporal loss with gradual increase
+    
+    Hard temporal discrimination: τ⁻ = τ⁺ ± Unif({1,2}) · T⁻¹
+    """
+    def __init__(
+            self, 
+            model, 
+            emb_regularizer: Regularizer,
+            temporal_regularizer: Regularizer,
+            amplitude_regularizer: Regularizer,
+            width_regularizer: Regularizer,
+            optimizer: optim.Optimizer,
+            dataset: TemporalDataset,
+            batch_size: int = 256,
+            margin: float = 0.3,
+            warmup_epochs: int = 5,
+            max_lambda_time: float = 1.0,
+            verbose: bool = True
+    ):
+        self.model = model
+        self.dataset = dataset
+        self.emb_regularizer = emb_regularizer
+        self.temporal_regularizer = temporal_regularizer
+        self.amplitude_regularizer = amplitude_regularizer
+        self.width_regularizer = width_regularizer
+        self.optimizer = optimizer
+        self.batch_size = batch_size
+        self.margin = margin
+        self.warmup_epochs = warmup_epochs
+        self.max_lambda_time = max_lambda_time
+        self.verbose = verbose
+        self.current_epoch = 0
+        
+        if not hasattr(dataset, 'ts_normalized') or dataset.ts_normalized is None:
+            raise ValueError("Dataset must have continuous time mappings loaded")
+        
+        # Freeze Gaussian parameters initially
+        self._freeze_gaussian_params()
+    
+    def _freeze_gaussian_params(self):
+        """Freeze Gaussian parameters (A, mu, s) during warm-up."""
+        if hasattr(self.model, 'time_encoder'):
+            self.model.time_encoder.A.requires_grad = False
+            self.model.time_encoder.mu.requires_grad = False
+            self.model.time_encoder.s.requires_grad = False
+    
+    def _unfreeze_gaussian_params(self):
+        """Unfreeze Gaussian parameters for dynamic training."""
+        if hasattr(self.model, 'time_encoder'):
+            self.model.time_encoder.A.requires_grad = True
+            self.model.time_encoder.mu.requires_grad = True
+            self.model.time_encoder.s.requires_grad = True
+    
+    def get_lambda_time(self):
+        """
+        Get current λ_time based on training stage.
+        Stage 1 (epochs 1-warmup_epochs): 0
+        Stage 2: Gradually increase from 0.1 to max_lambda_time
+        """
+        if self.current_epoch < self.warmup_epochs:
+            return 0.0
+        else:
+            # Linear ramp: 0.1 → max_lambda_time over next 10 epochs
+            progress = min((self.current_epoch - self.warmup_epochs) / 10.0, 1.0)
+            return 0.1 + progress * (self.max_lambda_time - 0.1)
+    
+    def sample_negative_time(self, pos_tau: torch.Tensor, pos_time_ids: torch.Tensor):
+        """
+        Sample negative times using hard temporal discrimination strategy.
+        τ⁻ = τ⁺ ± Unif({1,2}) · T⁻¹
+        
+        Args:
+            pos_tau: (batch,) positive continuous times
+            pos_time_ids: (batch,) positive timestamp IDs
+        
+        Returns:
+            neg_tau: (batch,) negative continuous times
+            neg_time_ids: (batch,) negative timestamp IDs
+        """
+        batch_size = pos_tau.shape[0]
+        n_times = len(self.dataset.ts_normalized)
+        
+        # Sample offset: ±1 or ±2 timesteps
+        offsets = torch.randint(1, 3, (batch_size,)).cpu()  # {1, 2}
+        signs = torch.randint(0, 2, (batch_size,)).cpu() * 2 - 1  # {-1, 1}
+        time_offsets = offsets * signs
+        
+        # Compute negative time IDs
+        neg_time_ids = pos_time_ids.cpu() + time_offsets
+        
+        # Handle boundary cases: resample if out of bounds
+        out_of_bounds = (neg_time_ids < 0) | (neg_time_ids >= n_times)
+        n_resample = out_of_bounds.sum().item()
+        if n_resample > 0:
+            neg_time_ids[out_of_bounds] = torch.randint(0, n_times, (n_resample,))
+        
+        # Convert to continuous times
+        neg_tau = torch.tensor(
+            [self.dataset.ts_normalized[int(tid)] for tid in neg_time_ids.numpy()],
+            dtype=torch.float32,
+            device=pos_tau.device
+        )
+        
+        return neg_tau, neg_time_ids
+    
+    def epoch(self, examples: torch.LongTensor):
+        # Check if we should transition from warm-up to dynamic
+        if self.current_epoch == self.warmup_epochs:
+            self._unfreeze_gaussian_params()
+            if self.verbose:
+                print(f"\n[Epoch {self.current_epoch + 1}] TRANSITIONING TO DYNAMIC TRAINING")
+                print(f"  - Unfroze Gaussian parameters (A, μ, s)")
+                print(f"  - Enabling temporal discrimination loss")
+        
+        actual_examples = examples[torch.randperm(examples.shape[0]), :]
+        loss_fn = nn.CrossEntropyLoss(reduction='mean')
+        lambda_time = self.get_lambda_time()
+        
+        with tqdm.tqdm(total=examples.shape[0], unit='ex', disable=not self.verbose) as bar:
+            stage = "WARMUP" if self.current_epoch < self.warmup_epochs else "DYNAMIC"
+            bar.set_description(f'[{stage}] train loss')
+            b_begin = 0
+            
+            while b_begin < examples.shape[0]:
+                input_batch = actual_examples[b_begin:b_begin + self.batch_size]
+                
+                # Convert to continuous time
+                batch_with_continuous_time = input_batch.clone().float()
+                timestamp_ids = input_batch[:, 3].cpu().numpy()
+                continuous_times = torch.tensor(
+                    [self.dataset.ts_normalized[int(tid)] for tid in timestamp_ids],
+                    dtype=torch.float32
+                )
+                batch_with_continuous_time[:, 3] = continuous_times
+                batch_with_continuous_time = batch_with_continuous_time.cuda()
+                
+                # Forward pass
+                predictions, factors, delta_e = self.model.forward(batch_with_continuous_time)
+                truth = input_batch[:, 2].cuda()
+                
+                # Primary loss (link prediction)
+                l_fit = loss_fn(predictions, truth)
+                
+                # Hard temporal discrimination loss
+                l_time_disc = torch.zeros_like(l_fit)
+                accuracy = 0.0
+                margin_mean = 0.0
+                
+                if lambda_time > 0 and hasattr(self.model, 'score'):
+                    pos_tau = batch_with_continuous_time[:, 3]
+                    pos_time_ids = input_batch[:, 3]
+                    
+                    # Sample hard negatives
+                    neg_tau, neg_time_ids = self.sample_negative_time(pos_tau, pos_time_ids)
+                    
+                    # Create negative batch
+                    batch_neg_time = batch_with_continuous_time.clone()
+                    batch_neg_time[:, 3] = neg_tau
+                    
+                    # Compute scores
+                    score_pos = self.model.score(batch_with_continuous_time)
+                    score_neg = self.model.score(batch_neg_time)
+                    
+                    # Hard temporal discrimination loss: ReLU(γ - (φ⁺ - φ⁻))
+                    margin_values = score_pos - score_neg
+                    raw_t_disc = torch.relu(self.margin - margin_values).mean()
+                    l_time_disc = lambda_time * raw_t_disc
+                    
+                    # Metrics
+                    accuracy = (score_pos > score_neg).float().mean().item()
+                    margin_mean = margin_values.mean().item()
+                
+                # Regularization
+                l_reg = self.emb_regularizer.forward(factors)
+                
+                # Amplitude decay regularization
+                l_amp = torch.zeros_like(l_reg)
+                if hasattr(self.model, 'time_encoder'):
+                    l_amp = self.amplitude_regularizer.forward(self.model.time_encoder.A)
+                
+                # Width penalty regularization
+                l_width = torch.zeros_like(l_reg)
+                if hasattr(self.model, 'time_encoder'):
+                    sigma = self.model.time_encoder.get_sigma()
+                    l_width = self.width_regularizer.forward(sigma)
+                
+                # Total loss
+                l = l_fit + l_reg + l_amp + l_width + l_time_disc
+                
+                # Backward and step
+                self.optimizer.zero_grad()
+                l.backward()
+                self.optimizer.step()
+                
+                b_begin += self.batch_size
+                bar.update(input_batch.shape[0])
+                bar.set_postfix({
+                    'loss': f'{l_fit.item():.4f}',
+                    'reg': f'{l_reg.item():.0f}',
+                    'amp': f'{l_amp.item():.4f}',
+                    'width': f'{l_width.item():.4f}',
+                    't_disc': f'{l_time_disc.item():.4f}',
+                    'λ_t': f'{lambda_time:.2f}',
+                    'acc': f'{accuracy:.3f}',
+                    'Δφ': f'{margin_mean:.3f}'
+                })
+        
+        self.current_epoch += 1

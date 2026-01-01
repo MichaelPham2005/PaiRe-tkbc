@@ -81,6 +81,60 @@ class TimeParameterRegularizer(Regularizer):
         return self.weight * (trend_reg + amplitude_reg)
 
 
+class AmplitudeDecayRegularizer(Regularizer):
+    """
+    Regularization for Gaussian amplitude parameters.
+    Suppresses unnecessary temporal energy.
+    
+    L_amp = weight * ||A||_2^2
+    """
+    def __init__(self, weight: float):
+        super(AmplitudeDecayRegularizer, self).__init__()
+        self.weight = weight
+    
+    def forward(self, A: torch.Tensor):
+        """
+        Regularize amplitude parameters.
+        
+        Args:
+            A: Amplitude tensor, shape (n_relations, K, dim)
+        Returns:
+            Regularization loss (scalar)
+        """
+        if self.weight == 0:
+            return torch.tensor(0.0)
+        
+        return self.weight * torch.sum(A ** 2)
+
+
+class WidthPenaltyRegularizer(Regularizer):
+    """
+    Width constraint regularizer for Gaussian pulses.
+    Prevents flat (static-like) Gaussians.
+    
+    L_σ = Σ ReLU(σ - σ_max)
+    """
+    def __init__(self, weight: float, sigma_max: float = 0.2):
+        super(WidthPenaltyRegularizer, self).__init__()
+        self.weight = weight
+        self.sigma_max = sigma_max
+    
+    def forward(self, sigma: torch.Tensor):
+        """
+        Penalize widths exceeding sigma_max.
+        
+        Args:
+            sigma: Width parameters, shape (n_relations, K)
+        Returns:
+            Regularization loss (scalar)
+        """
+        if self.weight == 0:
+            return torch.tensor(0.0)
+        
+        excess = torch.relu(sigma - self.sigma_max)
+        return self.weight * torch.sum(excess)
+
+
 # OLD REGULARIZERS - NOT USED IN NEW MODEL
 # Kept for compatibility with old checkpoints only
 

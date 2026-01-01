@@ -551,6 +551,306 @@ class RelationConditionedTimeEncoder(nn.Module):
         return m
 
 
+class GaussianTemporalEncoder(nn.Module):
+    """
+    Gaussian Evolution Temporal Encoder for GE-PairRE.
+    Each relation has K Gaussian pulses that activate at specific times.
+    
+    Formula:
+        G_{r,k}(τ) = exp(-(τ - μ_{r,k})² / (2σ_{r,k}² + ε))
+        Δe(r, τ) = Σ_k A_{r,k} · G_{r,k}(τ)
+    """
+    def __init__(self, n_relations: int, dim: int, K: int = 8, sigma_max: float = 0.2):
+        """
+        Args:
+            n_relations: Number of relations (includes inverse relations)
+            dim: Embedding dimension
+            K: Number of Gaussian pulses per relation
+            sigma_max: Maximum allowed width
+        """
+        super(GaussianTemporalEncoder, self).__init__()
+        self.n_relations = n_relations
+        self.dim = dim
+        self.K = K
+        self.sigma_max = sigma_max
+        self.eps = 1e-9  # For numerical stability
+        
+        # Per-relation Gaussian parameters
+        # Amplitude: A_{r,k} ∈ R^d for each relation and pulse
+        self.A = nn.Parameter(torch.randn(n_relations, K, dim) * 1e-4)
+        
+        # Mean: μ_{r,k} ∈ [0,1] for each pulse
+        # Initialize with evenly spaced centers
+        mu_init = torch.linspace(0, 1, K).unsqueeze(0).expand(n_relations, -1)
+        self.mu = nn.Parameter(mu_init)
+        
+        # Log-scale: s_{r,k} controls width σ = exp(s)
+        # Initialize small: σ ≈ 0.01 (s ≈ log(0.01) = -4.6)
+        s_init = torch.ones(n_relations, K) * np.log(0.01)
+        self.s = nn.Parameter(s_init)
+    
+    def get_sigma(self):
+        """Compute width σ = exp(s), ensuring σ > 0."""
+        return torch.exp(self.s)
+    
+    def forward(self, rel_id: torch.Tensor, tau: torch.Tensor):
+        """
+        Compute evolution vectors for given relations and times.
+        
+        Args:
+            rel_id: (batch,) relation indices
+            tau: (batch,) normalized timestamps in [0,1]
+        
+        Returns:
+            delta_e: (batch, dim) evolution vector
+        """
+        batch_size = rel_id.shape[0]
+        
+        # Lookup per-relation parameters
+        A = self.A[rel_id]  # (batch, K, dim)
+        mu = self.mu[rel_id]  # (batch, K)
+        sigma = self.get_sigma()[rel_id]  # (batch, K)
+        
+        # Compute Gaussian activations: G_{r,k}(τ) = exp(-(τ - μ)² / (2σ² + ε))
+        # tau: (batch,) -> (batch, 1)
+        # mu: (batch, K)
+        tau_expanded = tau.unsqueeze(1)  # (batch, 1)
+        diff = tau_expanded - mu  # (batch, K)
+        G = torch.exp(-diff ** 2 / (2 * sigma ** 2 + self.eps))  # (batch, K)
+        
+        # Compute evolution: Δe = Σ_k A_{r,k} · G_{r,k}(τ)
+        # G: (batch, K) -> (batch, K, 1) for broadcasting
+        # A: (batch, K, dim)
+        delta_e = torch.sum(A * G.unsqueeze(2), dim=1)  # (batch, dim)
+        
+        return delta_e
+
+
+class GEPairRE(TKBCModel):
+    """
+    Gaussian Evolution PairRE (GE-PairRE).
+    
+    Additive temporal evolution:
+        h_τ = h + Δe_h(r, τ)
+        t_τ = t + Δe_t(r⁻¹, τ)
+        φ(h, r, t, τ) = -||h_τ ∘ r^H - t_τ ∘ r^T||₁
+    
+    Key properties:
+    - Absolute static preservation (Δe → 0 when τ far from all μ)
+    - Event-driven dynamics (local Gaussian pulses)
+    - No oscillation artifacts
+    """
+    def __init__(self, sizes: Tuple[int, int, int, int], rank: int, 
+                 init_size: float = 1e-3, K: int = 8, sigma_max: float = 0.2):
+        super(GEPairRE, self).__init__()
+        self.sizes = sizes
+        self.rank = rank
+        self.K = K
+        self.sigma_max = sigma_max
+        
+        # Static embeddings
+        self.entity_embeddings = nn.Embedding(sizes[0], rank, sparse=True)
+        nn.init.xavier_normal_(self.entity_embeddings.weight)
+        self.entity_embeddings.weight.data *= init_size
+        
+        # Relation projections (PairRE style: r^H and r^T)
+        self.relation_head = nn.Embedding(sizes[1], rank, sparse=True)
+        self.relation_tail = nn.Embedding(sizes[1], rank, sparse=True)
+        nn.init.xavier_normal_(self.relation_head.weight)
+        nn.init.xavier_normal_(self.relation_tail.weight)
+        self.relation_head.weight.data *= init_size
+        self.relation_tail.weight.data *= init_size
+        
+        # Gaussian temporal encoder
+        self.time_encoder = GaussianTemporalEncoder(
+            n_relations=sizes[1], 
+            dim=rank, 
+            K=K,
+            sigma_max=sigma_max
+        )
+    
+    @staticmethod
+    def has_time():
+        return True
+    
+    def get_evolution_vectors(self, rel_id: torch.Tensor, tau: torch.Tensor):
+        """
+        Get evolution vectors for head and tail entities.
+        
+        For inverse relations: if rel_id >= n_relations/2, it's an inverse.
+        Head evolution uses forward relation, tail uses inverse.
+        
+        Args:
+            rel_id: (batch,) relation indices
+            tau: (batch,) timestamps
+        
+        Returns:
+            delta_e_h: (batch, dim) head evolution
+            delta_e_t: (batch, dim) tail evolution
+        """
+        # Forward relation for head evolution
+        delta_e_h = self.time_encoder(rel_id, tau)
+        
+        # For tail, we need the inverse relation
+        # In TKBC convention: inverse_id = rel_id + n_relations/2
+        n_base_relations = self.sizes[1] // 2
+        inverse_rel_id = torch.where(
+            rel_id < n_base_relations,
+            rel_id + n_base_relations,
+            rel_id - n_base_relations
+        )
+        delta_e_t = self.time_encoder(inverse_rel_id, tau)
+        
+        return delta_e_h, delta_e_t
+    
+    def score(self, x: torch.Tensor):
+        """
+        Score a batch of (h, r, t, tau) quadruples.
+        
+        Args:
+            x: (batch, 4) tensor [head_id, rel_id, tail_id, tau]
+        Returns:
+            scores: (batch,) L1-norm based scores
+        """
+        # Static embeddings
+        h = self.entity_embeddings(x[:, 0].long())
+        r_h = self.relation_head(x[:, 1].long())
+        t = self.entity_embeddings(x[:, 2].long())
+        r_t = self.relation_tail(x[:, 1].long())
+        
+        # Get evolution vectors
+        rel_id = x[:, 1].long()
+        tau = x[:, 3].float()
+        delta_e_h, delta_e_t = self.get_evolution_vectors(rel_id, tau)
+        
+        # Evolved entities
+        h_tau = h + delta_e_h
+        t_tau = t + delta_e_t
+        
+        # PairRE scoring: -||h_τ ∘ r^H - t_τ ∘ r^T||₁
+        interaction = h_tau * r_h - t_tau * r_t
+        score = -torch.norm(interaction, p=1, dim=-1)
+        return score
+    
+    def forward(self, x: torch.Tensor):
+        """
+        Forward pass for 1-vs-All prediction.
+        
+        Args:
+            x: (batch, 4) tensor [head_id, rel_id, tail_id, tau]
+        Returns:
+            scores: (batch, n_entities) scores for all entities
+            factors: tuple of embeddings for regularization
+            delta_e: (batch, dim) evolution vectors for visualization
+        """
+        batch_size = x.shape[0]
+        
+        # Static embeddings
+        h = self.entity_embeddings(x[:, 0].long())  # (batch, rank)
+        r_h = self.relation_head(x[:, 1].long())     # (batch, rank)
+        r_t = self.relation_tail(x[:, 1].long())     # (batch, rank)
+        
+        # Get evolution vectors
+        rel_id = x[:, 1].long()
+        tau = x[:, 3].float()
+        delta_e_h, delta_e_t = self.get_evolution_vectors(rel_id, tau)
+        
+        # Evolved head
+        h_tau = h + delta_e_h  # (batch, rank)
+        
+        # Get all entity embeddings
+        all_entities = self.entity_embeddings.weight  # (n_entities, rank)
+        
+        # VECTORIZED: Compute scores for all possible tails
+        # For each entity e_i as tail candidate:
+        #   score = -||h_τ ∘ r^H - (e_i + Δe_t) ∘ r^T||₁
+        
+        h_tau_r_h = (h_tau * r_h).unsqueeze(1)  # (batch, 1, rank)
+        r_t_expanded = r_t.unsqueeze(1)  # (batch, 1, rank)
+        delta_e_t_expanded = delta_e_t.unsqueeze(1)  # (batch, 1, rank)
+        all_entities_expanded = all_entities.unsqueeze(0)  # (1, n_entities, rank)
+        
+        # Evolved tail candidates
+        all_tails_tau = all_entities_expanded + delta_e_t_expanded  # (batch, n_entities, rank)
+        
+        # Compute interaction
+        interaction = h_tau_r_h - all_tails_tau * r_t_expanded  # (batch, n_entities, rank)
+        
+        # Compute L1 norm
+        scores = -torch.norm(interaction, p=1, dim=2)  # (batch, n_entities)
+        
+        # Factors for regularization
+        t = self.entity_embeddings(x[:, 2].long())
+        factors = (
+            torch.sqrt(h ** 2 + 1e-10),
+            torch.sqrt(r_h ** 2 + r_t ** 2 + 1e-10),
+            torch.sqrt(t ** 2 + 1e-10)
+        )
+        
+        return scores, factors, delta_e_h
+    
+    def forward_over_time(self, x: torch.Tensor):
+        """
+        Score (h, r, t) queries over all timestamps.
+        
+        Args:
+            x: (batch, 3) tensor [head, relation, tail] WITHOUT time
+        Returns:
+            scores: (batch, n_timestamps) scores for each timestamp
+        """
+        batch_size = x.shape[0]
+        
+        # Static embeddings
+        h = self.entity_embeddings(x[:, 0].long())
+        r_h = self.relation_head(x[:, 1].long())
+        t = self.entity_embeddings(x[:, 2].long())
+        r_t = self.relation_tail(x[:, 1].long())
+        rel_id = x[:, 1].long()
+        
+        # Get all normalized timestamps
+        n_timestamps = self.sizes[3]
+        all_taus = torch.linspace(0, 1, n_timestamps).to(h.device)
+        
+        # Expand for all timestamps
+        rel_id_exp = rel_id.unsqueeze(1).expand(-1, n_timestamps).reshape(-1)
+        all_taus_exp = all_taus.unsqueeze(0).expand(batch_size, -1).reshape(-1)
+        
+        # Compute evolution vectors for all times
+        delta_e_h_all, delta_e_t_all = self.get_evolution_vectors(rel_id_exp, all_taus_exp)
+        delta_e_h_all = delta_e_h_all.view(batch_size, n_timestamps, self.rank)
+        delta_e_t_all = delta_e_t_all.view(batch_size, n_timestamps, self.rank)
+        
+        # Evolved entities
+        h_tau_all = h.unsqueeze(1) + delta_e_h_all  # (batch, n_timestamps, rank)
+        t_tau_all = t.unsqueeze(1) + delta_e_t_all  # (batch, n_timestamps, rank)
+        
+        # Compute scores
+        h_tau_r_h = h_tau_all * r_h.unsqueeze(1)  # (batch, n_timestamps, rank)
+        t_tau_r_t = t_tau_all * r_t.unsqueeze(1)  # (batch, n_timestamps, rank)
+        interaction = h_tau_r_h - t_tau_r_t  # (batch, n_timestamps, rank)
+        scores = -torch.norm(interaction, p=1, dim=2)  # (batch, n_timestamps)
+        
+        return scores
+    
+    def get_rhs(self, chunk_begin: int, chunk_size: int):
+        """Get entity embeddings for ranking."""
+        return self.entity_embeddings.weight.data[
+            chunk_begin:chunk_begin + chunk_size
+        ].transpose(0, 1)
+    
+    def get_queries(self, queries: torch.Tensor):
+        """Compute query embeddings (left side of PairRE interaction)."""
+        h = self.entity_embeddings(queries[:, 0].long())
+        r_h = self.relation_head(queries[:, 1].long())
+        
+        rel_id = queries[:, 1].long()
+        tau = queries[:, 3].float()
+        delta_e_h, _ = self.get_evolution_vectors(rel_id, tau)
+        
+        h_tau = h + delta_e_h
+        return h_tau * r_h
+
+
 class ContinuousPairRE(TKBCModel):
     """
     Continuous-time PairRE with Relation-Conditioned Time Encoding and Residual Gate.

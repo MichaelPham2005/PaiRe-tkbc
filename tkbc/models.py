@@ -577,7 +577,8 @@ class GaussianTemporalEncoder(nn.Module):
         
         # Per-relation Gaussian parameters
         # Amplitude: A_{r,k} ∈ R^d for each relation and pulse
-        self.A = nn.Parameter(torch.randn(n_relations, K, dim) * 1e-4)
+        # Initialize with small but non-zero values to enable learning
+        self.A = nn.Parameter(torch.randn(n_relations, K, dim) * 1e-3)
         
         # Mean: μ_{r,k} ∈ [0,1] for each pulse
         # Initialize with evenly spaced centers
@@ -585,8 +586,9 @@ class GaussianTemporalEncoder(nn.Module):
         self.mu = nn.Parameter(mu_init)
         
         # Log-scale: s_{r,k} controls width σ = exp(s)
-        # Initialize small: σ ≈ 0.01 (s ≈ log(0.01) = -4.6)
-        s_init = torch.ones(n_relations, K) * np.log(0.01)
+        # Initialize to σ ≈ 0.2 (s ≈ log(0.2) = -1.6) for reasonable coverage
+        # σ = 0.2 means Gaussian covers ±0.4 (2σ) around mean
+        s_init = torch.ones(n_relations, K) * np.log(0.2)
         self.s = nn.Parameter(s_init)
     
     def get_sigma(self):
@@ -854,6 +856,90 @@ class GEPairRE(TKBCModel):
         
         h_tau = h + delta_e_h
         return h_tau * r_h
+    
+    def get_ranking(self, queries: torch.Tensor,
+                    filters: dict,
+                    batch_size: int = 1000, 
+                    chunk_size: int = 5000,
+                    timestamp_ids: torch.Tensor = None):
+        """
+        Custom ranking implementation for GE-PairRE using L1 distance.
+        Cannot use dot product like ComplEx since scoring is L1-based.
+        
+        Args:
+            queries: (n_queries, 4) [head, rel, tail, tau]
+            filters: dict of (h, r, t) -> list of entities to filter
+            batch_size: number of queries processed at once
+            chunk_size: number of entities scored at once
+            timestamp_ids: optional discrete timestamp IDs for filtering
+        """
+        ranks = torch.ones(len(queries))
+        
+        with torch.no_grad():
+            b_begin = 0
+            while b_begin < len(queries):
+                b_end = min(b_begin + batch_size, len(queries))
+                these_queries = queries[b_begin:b_end]
+                batch_len = b_end - b_begin
+                
+                # Get query components
+                h = self.entity_embeddings(these_queries[:, 0].long())
+                r_h = self.relation_head(these_queries[:, 1].long())
+                r_t = self.relation_tail(these_queries[:, 1].long())
+                
+                rel_id = these_queries[:, 1].long()
+                tau = these_queries[:, 3].float()
+                delta_e_h, delta_e_t = self.get_evolution_vectors(rel_id, tau)
+                
+                # Evolved head
+                h_tau_r_h = (h + delta_e_h) * r_h  # (batch, rank)
+                
+                # Get target scores
+                targets = self.score(these_queries).unsqueeze(1)  # (batch, 1)
+                
+                # Score all entities in chunks
+                n_entities = self.sizes[0]
+                all_scores = torch.zeros(batch_len, n_entities, device=queries.device)
+                
+                c_begin = 0
+                while c_begin < n_entities:
+                    c_end = min(c_begin + chunk_size, n_entities)
+                    
+                    # Get entity chunk
+                    entity_chunk = self.entity_embeddings.weight[c_begin:c_end]
+                    
+                    # Evolve entities: t_τ = t + Δe_t
+                    t_tau_chunk = entity_chunk.unsqueeze(0) + delta_e_t.unsqueeze(1)
+                    t_tau_r_t_chunk = t_tau_chunk * r_t.unsqueeze(1)
+                    
+                    # Compute L1 distance: -||h_τ∘r^H - t_τ∘r^T||₁
+                    interaction = h_tau_r_h.unsqueeze(1) - t_tau_r_t_chunk
+                    chunk_scores = -torch.norm(interaction, p=1, dim=2)
+                    
+                    all_scores[:, c_begin:c_end] = chunk_scores
+                    c_begin = c_end
+                
+                # Apply filters
+                for i, query in enumerate(these_queries):
+                    if timestamp_ids is not None:
+                        ts_for_filter = int(timestamp_ids[b_begin + i].item())
+                    else:
+                        ts_for_filter = int(query[3].item())
+                    
+                    filter_key = (int(query[0].item()), int(query[1].item()), ts_for_filter)
+                    filter_out = filters.get(filter_key, [])
+                    filter_out = filter_out + [int(query[2].item())]  # Add true tail
+                    
+                    all_scores[i, torch.LongTensor(filter_out)] = -1e6
+                
+                # Compute ranks
+                ranks[b_begin:b_end] += torch.sum(
+                    (all_scores >= targets).float(), dim=1
+                ).cpu()
+                
+                b_begin = b_end
+        
+        return ranks
 
 
 class ContinuousPairRE(TKBCModel):

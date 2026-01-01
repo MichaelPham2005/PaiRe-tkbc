@@ -371,6 +371,7 @@ class GEPairREOptimizer(object):
             margin: float = 0.3,
             warmup_epochs: int = 5,
             max_lambda_time: float = 1.0,
+            gradient_accumulation_steps: int = 1,
             verbose: bool = True
     ):
         self.model = model
@@ -384,6 +385,7 @@ class GEPairREOptimizer(object):
         self.margin = margin
         self.warmup_epochs = warmup_epochs
         self.max_lambda_time = max_lambda_time
+        self.gradient_accumulation_steps = gradient_accumulation_steps
         self.verbose = verbose
         self.current_epoch = 0
         
@@ -476,6 +478,7 @@ class GEPairREOptimizer(object):
             stage = "WARMUP" if self.current_epoch < self.warmup_epochs else "DYNAMIC"
             bar.set_description(f'[{stage}] train loss')
             b_begin = 0
+            accumulation_step = 0
             
             while b_begin < examples.shape[0]:
                 input_batch = actual_examples[b_begin:b_begin + self.batch_size]
@@ -540,16 +543,23 @@ class GEPairREOptimizer(object):
                     sigma = self.model.time_encoder.get_sigma()
                     l_width = self.width_regularizer.forward(sigma)
                 
-                # Total loss
-                l = l_fit + l_reg + l_amp + l_width + l_time_disc
+                # Total loss (scaled by accumulation steps)
+                l = (l_fit + l_reg + l_amp + l_width + l_time_disc) / self.gradient_accumulation_steps
                 
-                # Backward and step
-                self.optimizer.zero_grad()
+                # Backward
                 l.backward()
-                self.optimizer.step()
+                
+                # Update weights only after accumulating gradients
+                accumulation_step += 1
+                if accumulation_step % self.gradient_accumulation_steps == 0:
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
                 
                 b_begin += self.batch_size
                 bar.update(input_batch.shape[0])
+                
+                # Show metrics with proper scaling
+                actual_loss = l.item() * self.gradient_accumulation_steps
                 bar.set_postfix({
                     'loss': f'{l_fit.item():.4f}',
                     'reg': f'{l_reg.item():.0f}',
@@ -560,5 +570,10 @@ class GEPairREOptimizer(object):
                     'acc': f'{accuracy:.3f}',
                     'Δφ': f'{margin_mean:.3f}'
                 })
+            
+            # Final optimizer step if there are remaining gradients
+            if accumulation_step % self.gradient_accumulation_steps != 0:
+                self.optimizer.step()
+                self.optimizer.zero_grad()
         
         self.current_epoch += 1

@@ -735,6 +735,7 @@ class GEPairRE(TKBCModel):
     def forward(self, x: torch.Tensor):
         """
         Forward pass for 1-vs-All prediction.
+        Memory-efficient version using chunking for large entity sets.
         
         Args:
             x: (batch, 4) tensor [head_id, rel_id, tail_id, tau]
@@ -744,6 +745,7 @@ class GEPairRE(TKBCModel):
             delta_e: (batch, dim) evolution vectors for visualization
         """
         batch_size = x.shape[0]
+        n_entities = self.sizes[0]
         
         # Static embeddings
         h = self.entity_embeddings(x[:, 0].long())  # (batch, rank)
@@ -757,27 +759,30 @@ class GEPairRE(TKBCModel):
         
         # Evolved head
         h_tau = h + delta_e_h  # (batch, rank)
+        h_tau_r_h = h_tau * r_h  # (batch, rank)
         
-        # Get all entity embeddings
-        all_entities = self.entity_embeddings.weight  # (n_entities, rank)
+        # Compute scores in chunks to save memory
+        chunk_size = 5000  # Process 5000 entities at a time
+        scores = torch.zeros(batch_size, n_entities, device=x.device)
         
-        # VECTORIZED: Compute scores for all possible tails
-        # For each entity e_i as tail candidate:
-        #   score = -||h_τ ∘ r^H - (e_i + Δe_t) ∘ r^T||₁
-        
-        h_tau_r_h = (h_tau * r_h).unsqueeze(1)  # (batch, 1, rank)
-        r_t_expanded = r_t.unsqueeze(1)  # (batch, 1, rank)
-        delta_e_t_expanded = delta_e_t.unsqueeze(1)  # (batch, 1, rank)
-        all_entities_expanded = all_entities.unsqueeze(0)  # (1, n_entities, rank)
-        
-        # Evolved tail candidates
-        all_tails_tau = all_entities_expanded + delta_e_t_expanded  # (batch, n_entities, rank)
-        
-        # Compute interaction
-        interaction = h_tau_r_h - all_tails_tau * r_t_expanded  # (batch, n_entities, rank)
-        
-        # Compute L1 norm
-        scores = -torch.norm(interaction, p=1, dim=2)  # (batch, n_entities)
+        for chunk_start in range(0, n_entities, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, n_entities)
+            
+            # Get entity chunk
+            entity_chunk = self.entity_embeddings.weight[chunk_start:chunk_end]  # (chunk, rank)
+            
+            # Evolve entity chunk: t_τ = t + Δe_t
+            # delta_e_t: (batch, rank) -> (batch, 1, rank)
+            # entity_chunk: (chunk, rank) -> (1, chunk, rank)
+            t_tau_chunk = entity_chunk.unsqueeze(0) + delta_e_t.unsqueeze(1)  # (batch, chunk, rank)
+            
+            # Compute interaction: h_τ∘r^H - t_τ∘r^T
+            # h_tau_r_h: (batch, rank) -> (batch, 1, rank)
+            # r_t: (batch, rank) -> (batch, 1, rank)
+            interaction = h_tau_r_h.unsqueeze(1) - t_tau_chunk * r_t.unsqueeze(1)  # (batch, chunk, rank)
+            
+            # Compute L1 norm
+            scores[:, chunk_start:chunk_end] = -torch.norm(interaction, p=1, dim=2)  # (batch, chunk)
         
         # Factors for regularization
         t = self.entity_embeddings(x[:, 2].long())

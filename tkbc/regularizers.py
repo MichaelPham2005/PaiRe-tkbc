@@ -51,6 +51,152 @@ class ContinuousTimeLambda3(Regularizer):
         return norm / factor.shape[0]
 
 
+<<<<<<< Updated upstream
+=======
+class TimeParameterRegularizer(Regularizer):
+    """
+    Light regularization on relation-conditioned time parameters (a_r, A_r).
+    Does NOT regularize output m_r(t) directly to avoid collapse.
+    
+    L_time_param = weight * (||a_r||_2^2 + ||A_r||_2^2)
+    """
+    def __init__(self, weight: float):
+        super(TimeParameterRegularizer, self).__init__()
+        self.weight = weight
+    
+    def forward(self, a_r: torch.Tensor, A_r: torch.Tensor):
+        """
+        Regularize trend and amplitude parameters.
+        
+        Args:
+            a_r: Trend parameters, shape (n_relations,)
+            A_r: Amplitude parameters, shape (n_relations, K)
+        Returns:
+            Regularization loss (scalar)
+        """
+        if self.weight == 0:
+            return torch.tensor(0.0)
+        
+        trend_reg = torch.sum(a_r ** 2)
+        amplitude_reg = torch.sum(A_r ** 2)
+        
+        return self.weight * (trend_reg + amplitude_reg)
+
+
+class AmplitudeDecayRegularizer(Regularizer):
+    """
+    Regularization for Gaussian amplitude parameters.
+    Suppresses unnecessary temporal energy.
+    
+    L_amp = weight * ||A||_2^2
+    """
+    def __init__(self, weight: float):
+        super(AmplitudeDecayRegularizer, self).__init__()
+        self.weight = weight
+    
+    def forward(self, A: torch.Tensor):
+        """
+        Regularize amplitude parameters.
+        
+        Args:
+            A: Amplitude tensor, shape (n_relations, K, dim)
+        Returns:
+            Regularization loss (scalar)
+        """
+        if self.weight == 0:
+            return torch.tensor(0.0)
+        
+        return self.weight * torch.sum(A ** 2)
+
+
+class WidthPenaltyRegularizer(Regularizer):
+    """
+    Width constraint regularizer for Gaussian pulses.
+    Prevents flat (static-like) Gaussians.
+    
+    L_σ = Σ ReLU(σ - σ_max)
+    """
+    def __init__(self, weight: float, sigma_max: float = 0.2):
+        super(WidthPenaltyRegularizer, self).__init__()
+        self.weight = weight
+        self.sigma_max = sigma_max
+    
+    def forward(self, sigma: torch.Tensor):
+        """
+        Penalize widths exceeding sigma_max.
+        
+        Args:
+            sigma: Width parameters, shape (n_relations, K)
+        Returns:
+            Regularization loss (scalar)
+        """
+        if self.weight == 0:
+            return torch.tensor(0.0)
+        
+        excess = torch.relu(sigma - self.sigma_max)
+        return self.weight * torch.sum(excess)
+
+
+class SigmaLowerBoundRegularizer(Regularizer):
+    """
+    Regularizer to enforce σ_min lower bound.
+    
+    L_sigma = Σ ReLU(σ_min - σ)
+    
+    Prevents Gaussians from becoming too narrow (overfitting to single timestamps).
+    """
+    
+    def __init__(self, weight: float = 0.1, sigma_min: float = 0.02):
+        super(SigmaLowerBoundRegularizer, self).__init__()
+        self.weight = weight
+        self.sigma_min = sigma_min
+    
+    def forward(self, sigma: torch.Tensor):
+        """
+        Args:
+            sigma: Width parameters (n_relations, K)
+        """
+        if self.weight == 0:
+            return torch.tensor(0.0)
+        
+        # Penalize σ < σ_min
+        violation = torch.relu(self.sigma_min - sigma)
+        return self.weight * torch.sum(violation)
+
+
+class TemporalSmoothnessRegularizer(Regularizer):
+    """
+    Regularizer for temporal smoothness.
+    Penalizes large changes in evolution vectors over small time intervals.
+    
+    L_smooth = Σ ||Δe_r(τ) - Δe_r(τ + ε)||²
+    """
+    
+    def __init__(self, weight: float = 0.01, epsilon: float = 0.01):
+        super(TemporalSmoothnessRegularizer, self).__init__()
+        self.weight = weight
+        self.epsilon = epsilon
+    
+    def forward(self, encoder, rel_id: torch.Tensor, tau: torch.Tensor):
+        """
+        Compute weighted smoothness loss.
+        
+        Args:
+            encoder: DualComponentEncoder instance
+            rel_id: (batch,) relation indices
+            tau: (batch,) timestamps
+        """
+        if self.weight == 0:
+            return torch.tensor(0.0)
+        
+        smoothness = encoder.compute_smoothness_loss(rel_id, tau, self.epsilon)
+        return self.weight * smoothness
+
+
+# OLD REGULARIZERS - NOT USED IN NEW MODEL
+# Kept for compatibility with old checkpoints only
+
+>>>>>>> Stashed changes
 class ContinuitySmoothness(Regularizer):
     """
     Continuity regularizer for time embeddings m = cos(W·t + b).

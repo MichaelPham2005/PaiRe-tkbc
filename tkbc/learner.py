@@ -10,15 +10,9 @@ import json
 from pathlib import Path
 
 from datasets import TemporalDataset
-<<<<<<< Updated upstream
-from optimizers import TKBCOptimizer, IKBCOptimizer, ContinuousTimeOptimizer
-from models import ComplEx, TComplEx, TNTComplEx, ContinuousPairRE
-from regularizers import N3, Lambda3, ContinuousTimeLambda3, ContinuitySmoothness
-=======
 from optimizers import TKBCOptimizer, IKBCOptimizer, ContinuousTimeOptimizer, GEPairREOptimizer
 from models import ComplEx, TComplEx, TNTComplEx, ContinuousPairRE, GEPairRE
 from regularizers import N3, Lambda3, ContinuousTimeLambda3, TimeParameterRegularizer, AmplitudeDecayRegularizer, WidthPenaltyRegularizer, TemporalSmoothnessRegularizer, SigmaLowerBoundRegularizer
->>>>>>> Stashed changes
 
 parser = argparse.ArgumentParser(
     description="Temporal ComplEx"
@@ -28,7 +22,7 @@ parser.add_argument(
     help="Dataset name"
 )
 models = [
-    'ComplEx', 'TComplEx', 'TNTComplEx', 'ContinuousPairRE'
+    'ComplEx', 'TComplEx', 'TNTComplEx', 'ContinuousPairRE', 'GEPairRE'
 ]
 parser.add_argument(
     '--model', choices=models,
@@ -63,15 +57,41 @@ parser.add_argument(
     help="Timestamp regularizer strength"
 )
 parser.add_argument(
-    '--smoothness_reg', default=0., type=float,
-    help="Continuity smoothness regularizer for W and b (ContinuousPairRE only)"
+    '--time_param_reg', default=0., type=float,
+    help="Time parameter regularizer for a_r and A_r (ContinuousPairRE only)"
+)
+parser.add_argument(
+    '--time_discrimination_weight', default=0.1, type=float,
+    help="Weight for time discrimination loss (ContinuousPairRE only)"
+)
+parser.add_argument(
+    '--K_frequencies', default=16, type=int,
+    help="Number of frequency components for relation-conditioned time encoder (ContinuousPairRE only)"
+)
+parser.add_argument(
+    '--beta', default=0.5, type=float,
+    help="Beta parameter for residual gate (ContinuousPairRE only)"
+)
+parser.add_argument(
+    '--time_scale', default=1.0, type=float,
+    help="Time normalization scale (1.0 for [0,1], 10.0 for [0,10])"
+)
+parser.add_argument(
+    '--loss', default='cross_entropy', choices=['cross_entropy', 'self_adversarial'],
+    help="Loss function to use. 'cross_entropy' is standard Softmax. 'self_adversarial' is PairRE/RotatE style."
+)
+parser.add_argument(
+    '--margin', default=6.0, type=float,
+    help="Margin gamma for Self-Adversarial Loss"
+)
+parser.add_argument(
+    '--adversarial_temperature', default=1.0, type=float,
+    help="Temperature alpha for self-adversarial negative sampling"
 )
 parser.add_argument(
     '--no_time_emb', default=False, action="store_true",
     help="Use a specific embedding for non temporal relations"
 )
-<<<<<<< Updated upstream
-=======
 # GE-PairRE specific arguments
 parser.add_argument(
     '--K_gaussians', default=8, type=int,
@@ -109,13 +129,12 @@ parser.add_argument(
     '--max_lambda_time', default=1.0, type=float,
     help="Maximum value for λ_time in dynamic stage (GEPairRE only)"
 )
->>>>>>> Stashed changes
 
 
 args = parser.parse_args()
 
-# Use continuous time for ContinuousPairRE model
-use_continuous = (args.model == 'ContinuousPairRE')
+# Use continuous time for ContinuousPairRE and GEPairRE models
+use_continuous = (args.model in ['ContinuousPairRE', 'GEPairRE'])
 dataset = TemporalDataset(args.dataset, use_continuous_time=use_continuous)
 
 sizes = dataset.get_shape()
@@ -123,13 +142,9 @@ model = {
     'ComplEx': ComplEx(sizes, args.rank),
     'TComplEx': TComplEx(sizes, args.rank, no_time_emb=args.no_time_emb),
     'TNTComplEx': TNTComplEx(sizes, args.rank, no_time_emb=args.no_time_emb),
-<<<<<<< Updated upstream
-    'ContinuousPairRE': ContinuousPairRE(sizes, args.rank),
-=======
     'ContinuousPairRE': ContinuousPairRE(sizes, args.rank, K=args.K_frequencies, beta=args.beta),
     'GEPairRE': GEPairRE(sizes, args.rank, K=args.K_gaussians, 
                          sigma_min=args.sigma_min, sigma_max=args.sigma_max),
->>>>>>> Stashed changes
 }[args.model]
 model = model.cuda()
 
@@ -166,9 +181,6 @@ print(f"Validation frequency: every {args.valid_freq} epochs")
 print(f"Embedding regularization (N3): {args.emb_reg}")
 print(f"Time regularization: {args.time_reg}")
 if args.model == 'ContinuousPairRE':
-<<<<<<< Updated upstream
-    print(f"Smoothness regularization (W/b): {args.smoothness_reg}")
-=======
     print(f"K frequencies: {args.K_frequencies}")
     print(f"Beta (residual gate): {args.beta}")
     print(f"Time parameter regularization: {args.time_param_reg}")
@@ -185,7 +197,6 @@ elif args.model == 'GEPairRE':
     print(f"Sigma bound regularization: {args.sigma_bound_reg}")
     print(f"Max λ_time: {args.max_lambda_time}")
     print(f"Margin (hard temporal discrimination): {args.margin}")
->>>>>>> Stashed changes
 print(f"Checkpoint directory: {checkpoint_dir}")
 print("="*70 + "\n")
 
@@ -194,10 +205,6 @@ opt = optim.Adagrad(model.parameters(), lr=args.learning_rate)
 emb_reg = N3(args.emb_reg)
 # Use ContinuousTimeLambda3 for ContinuousPairRE, Lambda3 for others
 time_reg = ContinuousTimeLambda3(args.time_reg) if args.model == 'ContinuousPairRE' else Lambda3(args.time_reg)
-<<<<<<< Updated upstream
-# Add smoothness regularizer for continuous time models
-smoothness_reg = ContinuitySmoothness(args.smoothness_reg) if args.model == 'ContinuousPairRE' else None
-=======
 # Add time parameter regularizer for continuous time models
 from regularizers import TimeParameterRegularizer
 time_param_reg = TimeParameterRegularizer(args.time_param_reg) if args.model == 'ContinuousPairRE' else None
@@ -214,7 +221,6 @@ sigma_bound_reg = SigmaLowerBoundRegularizer(
     weight=args.sigma_bound_reg if hasattr(args, 'sigma_bound_reg') else 0.1,
     sigma_min=args.sigma_min if hasattr(args, 'sigma_min') else 0.02
 ) if args.model == 'GEPairRE' else None
->>>>>>> Stashed changes
 
 # Track best validation MRR for saving best model
 best_valid_mrr = 0.0
@@ -234,8 +240,6 @@ for epoch in range(args.max_epochs):
             batch_size=args.batch_size
         )
         optimizer.epoch(examples)
-<<<<<<< Updated upstream
-=======
     elif args.model == 'GEPairRE':
         # Use GE-PairRE optimizer with 2-stage training
         optimizer = GEPairREOptimizer(
@@ -248,15 +252,40 @@ for epoch in range(args.max_epochs):
             max_lambda_time=args.max_lambda_time
         )
         optimizer.epoch(examples, epoch_num=epoch)
->>>>>>> Stashed changes
     elif args.model == 'ContinuousPairRE':
         # Use continuous time optimizer for ContinuousPairRE
         optimizer = ContinuousTimeOptimizer(
             model, emb_reg, time_reg, opt, dataset,
             batch_size=args.batch_size,
-            smoothness_regularizer=smoothness_reg
+            time_param_regularizer=time_param_reg,
+            loss_type=args.loss,
+            margin=args.margin,
+            adversarial_temperature=args.adversarial_temperature,
+            time_discrimination_weight=args.time_discrimination_weight
         )
         optimizer.epoch(examples)
+        
+        # TEST B2: Track parameter updates every epoch
+        if args.model == 'ContinuousPairRE' and hasattr(model, 'time_encoder'):
+            with torch.no_grad():
+                if hasattr(model, '_prev_params'):
+                    delta_a_r = (model.time_encoder.a_r - model._prev_params['a_r']).norm().item()
+                    delta_A_r = (model.time_encoder.A_r - model._prev_params['A_r']).norm().item()
+                    delta_P_r = (model.time_encoder.P_r - model._prev_params['P_r']).norm().item()
+                    delta_W_proj = (model.time_encoder.W_proj - model._prev_params['W_proj']).norm().item()
+                    
+                    print(f"[Epoch {epoch+1}] Parameter Updates: Δa_r={delta_a_r:.2e}, ΔA_r={delta_A_r:.2e}, ΔP_r={delta_P_r:.2e}, ΔW_proj={delta_W_proj:.2e}")
+                    
+                    if delta_a_r < 1e-6 and delta_A_r < 1e-6:
+                        print("  ⚠️  WARNING: Time parameters barely changing!")
+                
+                # Save current for next comparison
+                model._prev_params = {
+                    'a_r': model.time_encoder.a_r.clone(),
+                    'A_r': model.time_encoder.A_r.clone(),
+                    'P_r': model.time_encoder.P_r.clone(),
+                    'W_proj': model.time_encoder.W_proj.clone()
+                }
     else:
         optimizer = TKBCOptimizer(
             model, emb_reg, time_reg, opt,
@@ -283,20 +312,19 @@ for epoch in range(args.max_epochs):
         print(f"EPOCH {epoch + 1}/{args.max_epochs} - VALIDATION (every {args.valid_freq} epochs)")
         print(f"{'='*70}")
         
-        # Print alpha statistics for ContinuousPairRE to monitor temporal gating
-        if args.model == 'ContinuousPairRE':
+        # Print time encoder statistics for ContinuousPairRE
+        if args.model == 'ContinuousPairRE' and hasattr(model, 'time_encoder'):
             with torch.no_grad():
-                alphas = torch.sigmoid(model.alpha.weight).cpu()
-                print(f"\nAlpha Statistics:")
-                print(f"  Mean: {alphas.mean().item():.4f}")
-                print(f"  Std:  {alphas.std().item():.4f}")
-                print(f"  Min:  {alphas.min().item():.4f}")
-                print(f"  Max:  {alphas.max().item():.4f}")
-                # Count static vs dynamic relations
-                static_count = (alphas < 0.3).sum().item()
-                dynamic_count = (alphas > 0.7).sum().item()
-                print(f"  Static relations (α<0.3): {static_count}/{len(alphas)}")
-                print(f"  Dynamic relations (α>0.7): {dynamic_count}/{len(alphas)}")
+                a_r = model.time_encoder.a_r.cpu()
+                A_r = model.time_encoder.A_r.cpu()
+                print(f"\nTime Encoder Statistics:")
+                print(f"  Beta (gate strength): {model.beta:.4f}")
+                print(f"  Trend (a_r):")
+                print(f"    Mean: {a_r.mean().item():.4f}, Std: {a_r.std().item():.4f}")
+                print(f"    Range: [{a_r.min().item():.4f}, {a_r.max().item():.4f}]")
+                print(f"  Amplitude (A_r):")
+                print(f"    Mean: {A_r.mean().item():.4f}, Std: {A_r.std().item():.4f}")
+                print(f"    Range: [{A_r.min().item():.4f}, {A_r.max().item():.4f}]")
         
         model.eval()
         with torch.no_grad():
@@ -323,18 +351,16 @@ for epoch in range(args.max_epochs):
         with open(log_file, 'a', encoding='utf-8') as f:
             f.write(f"\nEpoch {epoch + 1}/{args.max_epochs}\n")
             f.write(f"{'-'*70}\n")
-            if args.model == 'ContinuousPairRE':
+            if args.model == 'ContinuousPairRE' and hasattr(model, 'time_encoder'):
                 with torch.no_grad():
-                    alphas = torch.sigmoid(model.alpha.weight).cpu()
-                    f.write(f"Alpha Statistics:\n")
-                    f.write(f"  Mean: {alphas.mean().item():.4f}, ")
-                    f.write(f"Std: {alphas.std().item():.4f}, ")
-                    f.write(f"Min: {alphas.min().item():.4f}, ")
-                    f.write(f"Max: {alphas.max().item():.4f}\n")
-                    static_count = (alphas < 0.3).sum().item()
-                    dynamic_count = (alphas > 0.7).sum().item()
-                    f.write(f"  Static (a<0.3): {static_count}/{len(alphas)}, ")
-                    f.write(f"Dynamic (a>0.7): {dynamic_count}/{len(alphas)}\n")
+                    a_r = model.time_encoder.a_r.cpu()
+                    A_r = model.time_encoder.A_r.cpu()
+                    f.write(f"Time Encoder Statistics:\n")
+                    f.write(f"  Beta: {model.beta:.4f}\n")
+                    f.write(f"  Trend (a_r): Mean={a_r.mean().item():.4f}, Std={a_r.std().item():.4f}, ")
+                    f.write(f"Range=[{a_r.min().item():.4f}, {a_r.max().item():.4f}]\n")
+                    f.write(f"  Amplitude (A_r): Mean={A_r.mean().item():.4f}, Std={A_r.std().item():.4f}, ")
+                    f.write(f"Range=[{A_r.min().item():.4f}, {A_r.max().item():.4f}]\n")
             
             if dataset.has_intervals():
                 f.write(f"Valid: {valid}\n")

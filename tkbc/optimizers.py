@@ -127,29 +127,41 @@ class IKBCOptimizer(object):
 
 
 class ContinuousTimeOptimizer(object):
-    """Optimizer for continuous time models."""
+    """Optimizer for continuous time models with relation-conditioned time encoding."""
     def __init__(
             self, model: TKBCModel,
             emb_regularizer: Regularizer, temporal_regularizer: Regularizer,
             optimizer: optim.Optimizer, dataset: TemporalDataset,
             batch_size: int = 256, verbose: bool = True,
-            smoothness_regularizer: Regularizer = None
+            time_param_regularizer: Regularizer = None,
+            loss_type: str = 'cross_entropy',
+            margin: float = 6.0,
+            adversarial_temperature: float = 1.0,
+            time_discrimination_weight: float = 0.1
     ):
         self.model = model
         self.dataset = dataset
         self.emb_regularizer = emb_regularizer
         self.temporal_regularizer = temporal_regularizer
-        self.smoothness_regularizer = smoothness_regularizer
+        self.time_param_regularizer = time_param_regularizer
         self.optimizer = optimizer
         self.batch_size = batch_size
         self.verbose = verbose
+        self.loss_type = loss_type
+        self.margin = margin
+        self.adversarial_temperature = adversarial_temperature
+        self.time_discrimination_weight = time_discrimination_weight
+        self.current_epoch = 0  # Track current epoch
         
         if not hasattr(dataset, 'ts_normalized') or dataset.ts_normalized is None:
             raise ValueError("Dataset must have continuous time mappings loaded")
 
     def epoch(self, examples: torch.LongTensor):
         actual_examples = examples[torch.randperm(examples.shape[0]), :]
-        loss = nn.CrossEntropyLoss(reduction='mean')
+        
+        # Define loss function based on type
+        if self.loss_type == 'cross_entropy':
+            loss_fn = nn.CrossEntropyLoss(reduction='mean')
         
         with tqdm.tqdm(total=examples.shape[0], unit='ex', disable=not self.verbose) as bar:
             bar.set_description(f'train loss')
@@ -173,34 +185,134 @@ class ContinuousTimeOptimizer(object):
                 predictions, factors, time = self.model.forward(batch_with_continuous_time)
                 truth = input_batch[:, 2].cuda()
 
-                l_fit = loss(predictions, truth)
+                if self.loss_type == 'cross_entropy':
+                    l_fit = loss_fn(predictions, truth)
+                elif self.loss_type == 'self_adversarial':
+                    # Self-Adversarial Negative Sampling Loss
+                    pos_scores = predictions.gather(1, truth.view(-1, 1))
+                    
+                    # Create mask for negatives
+                    batch_size_local, n_entities = predictions.shape
+                    neg_mask = torch.ones((batch_size_local, n_entities), dtype=torch.bool, device=predictions.device)
+                    neg_mask.scatter_(1, truth.view(-1, 1), 0)
+                    
+                    # Negative scores
+                    neg_scores = predictions[neg_mask].view(batch_size_local, -1)
+                    
+                    # Self-Adversarial Weights for negatives
+                    neg_weights = torch.softmax(neg_scores * self.adversarial_temperature, dim=1).detach()
+                    
+                    # Compute Loss
+                    loss_pos = -torch.log(torch.sigmoid(self.margin + pos_scores) + 1e-9).mean()
+                    loss_neg = -torch.sum(
+                        neg_weights * torch.log(torch.sigmoid(-neg_scores - self.margin) + 1e-9),
+                        dim=1
+                    ).mean()
+                    
+                    l_fit = (loss_pos + loss_neg) / 2
+                
+                # Time Discrimination Loss (CRITICAL FOR NEW MODEL)
+                l_time_disc = torch.zeros_like(l_fit)
+                raw_t_disc = torch.zeros_like(l_fit)
+                score_diff_mean = 0.0
+                score_diff_std = 0.0
+                tau_collision_rate = 0.0
+                
+                if self.time_discrimination_weight > 0 and hasattr(self.model, 'score'):
+                    # Sample negative times for each positive
+                    n_times = len(self.dataset.ts_normalized)
+                    neg_time_ids = torch.randint(0, n_times, (batch_with_continuous_time.shape[0],))
+                    neg_continuous_times = torch.tensor(
+                        [self.dataset.ts_normalized[int(tid)] for tid in neg_time_ids.cpu().numpy()],
+                        dtype=torch.float32,
+                        device=batch_with_continuous_time.device
+                    )
+                    
+                    # Create negative batch with wrong times
+                    batch_neg_time = batch_with_continuous_time.clone()
+                    batch_neg_time[:, 3] = neg_continuous_times
+                    
+                    # Compute scores
+                    score_pos = self.model.score(batch_with_continuous_time)  # (batch,)
+                    score_neg_time = self.model.score(batch_neg_time)  # (batch,)
+                    
+                    # Time discrimination loss: -log σ(φ(+) - φ(-))
+                    raw_t_disc = -torch.log(torch.sigmoid(score_pos - score_neg_time) + 1e-9).mean()
+                    l_time_disc = self.time_discrimination_weight * raw_t_disc
+                    
+                    # Step C: Check score difference and tau collision
+                    score_diff = score_pos - score_neg_time
+                    score_diff_mean = score_diff.mean().item()
+                    score_diff_std = score_diff.std().item()
+                    
+                    # Check if negative times accidentally match positive times
+                    # Compare time_ids (integers), not continuous values
+                    pos_time_ids = input_batch[:, 3].cpu()  # Original time_ids
+                    tau_collision_rate = (neg_time_ids.cpu() == pos_time_ids).float().mean().item()
+
+                
                 l_reg = self.emb_regularizer.forward(factors)
                 l_time = torch.zeros_like(l_reg)
                 if time is not None:
                     l_time = self.temporal_regularizer.forward(time)
                 
-                # Add smoothness regularization on W and b
-                l_smooth = torch.zeros_like(l_reg)
-                if self.smoothness_regularizer is not None and hasattr(self.model, 'time_encoder'):
-                    W = self.model.time_encoder.W
-                    b = self.model.time_encoder.b
-                    l_smooth = self.smoothness_regularizer.forward(W, b)
+                # Time parameter regularization (light)
+                l_time_param = torch.zeros_like(l_reg)
+                if self.time_param_regularizer is not None and hasattr(self.model, 'time_encoder'):
+                    a_r = self.model.time_encoder.a_r
+                    A_r = self.model.time_encoder.A_r
+                    l_time_param = self.time_param_regularizer.forward(a_r, A_r)
                 
-                l = l_fit + l_reg + l_time + l_smooth
+                l = l_fit + l_reg + l_time + l_time_param + l_time_disc
 
                 self.optimizer.zero_grad()
                 l.backward()
+                
+                # Initialize postfix_dict first
+                postfix_dict = {
+                    'loss': f'{l_fit.item():.4f}',
+                    'reg': f'{l_reg.item():.0f}',
+                    'cont': f'{l_time.item():.0f}',
+                    't_param': f'{l_time_param.item():.4f}',
+                    't_disc': f'{l_time_disc.item():.4f}'
+                }
+                
+                # TEST B1: Gradient norm tracking (every 50 batches)
+                batch_idx = (b_begin) // self.batch_size
+                if batch_idx % 50 == 0:
+                    grad_entity = 0.0
+                    grad_relation = 0.0
+                    grad_time = 0.0
+                    
+                    if self.model.entity_embeddings.weight.grad is not None:
+                        grad_entity = self.model.entity_embeddings.weight.grad.norm().item()
+                    
+                    if self.model.relation_head.weight.grad is not None:
+                        grad_relation += self.model.relation_head.weight.grad.norm().item()
+                    if self.model.relation_tail.weight.grad is not None:
+                        grad_relation += self.model.relation_tail.weight.grad.norm().item()
+                    
+                    if hasattr(self.model, 'time_encoder'):
+                        if self.model.time_encoder.a_r.grad is not None:
+                            grad_time += self.model.time_encoder.a_r.grad.norm().item()
+                        if self.model.time_encoder.A_r.grad is not None:
+                            grad_time += self.model.time_encoder.A_r.grad.norm().item()
+                        if self.model.time_encoder.P_r.grad is not None:
+                            grad_time += self.model.time_encoder.P_r.grad.norm().item()
+                        if self.model.time_encoder.W_proj.grad is not None:
+                            grad_time += self.model.time_encoder.W_proj.grad.norm().item()
+                    
+                    grad_all = grad_entity + grad_relation + grad_time
+                    time_grad_ratio = grad_time / grad_all if grad_all > 0 else 0.0
+                    
+                    postfix_dict['grad_ent'] = f'{grad_entity:.2e}'
+                    postfix_dict['grad_rel'] = f'{grad_relation:.2e}'
+                    postfix_dict['grad_time'] = f'{grad_time:.2e}'
+                    postfix_dict['time_ratio'] = f'{time_grad_ratio*100:.1f}%'
+                
                 self.optimizer.step()
                 b_begin += self.batch_size
                 bar.update(input_batch.shape[0])
-<<<<<<< Updated upstream
-                bar.set_postfix(
-                    loss=f'{l_fit.item():.0f}',
-                    reg=f'{l_reg.item():.0f}',
-                    cont=f'{l_time.item():.0f}',
-                    smooth=f'{l_smooth.item():.4f}'
-                )
-=======
                 
                 # Bước A & B: Detailed diagnostics every 50 batches
                 batch_idx = (b_begin - self.batch_size) // self.batch_size
@@ -502,4 +614,3 @@ class GEPairREOptimizer(object):
                 self.optimizer.zero_grad()
         
         self.current_epoch += 1
->>>>>>> Stashed changes

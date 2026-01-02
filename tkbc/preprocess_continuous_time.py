@@ -21,12 +21,13 @@ def parse_date(date_str):
         except:
             return None
 
-def normalize_timestamps(dataset_name):
+def normalize_timestamps(dataset_name, time_scale=1.0):
     """
-    Read ts_id file, normalize timestamps to [0, 100] range, and save.
+    Read ts_id file, normalize timestamps to [0, time_scale] range, and save.
     
     Args:
         dataset_name: Name of the dataset (e.g., 'ICEWS14', 'ICEWS05-15', 'yago15k')
+        time_scale: Scale factor for normalized time (default 1.0 for [0,1] range)
     """
     dataset_path = DATA_PATH / dataset_name
     ts_id_path = dataset_path / "ts_id"
@@ -71,18 +72,21 @@ def normalize_timestamps(dataset_name):
     
     real_timestamps = np.array(real_timestamps)
     
-    # Min-Max normalization to [0, 100]
-    t_min = real_timestamps.min()
-    t_max = real_timestamps.max()
+    # Min-Max normalization to [0, time_scale]
+    # Formula: tau(l) = time_scale * l / (T - 1)
+    # This gives uniform spacing in [0, time_scale]
+    T = len(ts_ids)
     
-    if t_max == t_min:
-        print(f"Warning: All timestamps are the same in {dataset_name}")
-        normalized_timestamps = np.zeros_like(real_timestamps)
+    if T == 1:
+        print(f"Warning: Only one timestamp in {dataset_name}")
+        normalized_timestamps = np.zeros(1)
     else:
-        normalized_timestamps = (real_timestamps - t_min) / (t_max - t_min) * 100.0
+        # Use index-based normalization for uniform spacing
+        normalized_timestamps = time_scale * np.arange(T) / (T - 1)
     
     print(f"Time range: {date_strings[0]} to {date_strings[-1]}")
-    print(f"Normalized range: [{normalized_timestamps.min():.2f}, {normalized_timestamps.max():.2f}]")
+    print(f"Normalized range: [{normalized_timestamps.min():.4f}, {normalized_timestamps.max():.4f}]")
+    print(f"Time scale: {time_scale}")
     
     # Create mapping: timestamp_id -> normalized_time
     ts_id_to_normalized = {ts_id: normalized_timestamps[i] for i, ts_id in enumerate(ts_ids)}
@@ -102,15 +106,23 @@ def normalize_timestamps(dataset_name):
     return ts_id_to_normalized
 
 if __name__ == "__main__":
-    datasets = ['ICEWS14', 'ICEWS05-15', 'yago15k', 'wikidata']
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Normalize timestamps for temporal KG datasets')
+    parser.add_argument('--datasets', nargs='+', default=['ICEWS14', 'ICEWS05-15', 'yago15k', 'wikidata'],
+                       help='List of datasets to process')
+    parser.add_argument('--time_scale', type=float, default=1.0,
+                       help='Scale factor for normalized time (default 1.0 for [0,1] range)')
+    args = parser.parse_args()
     
     print("="*60)
     print("Continuous Time Normalization Preprocessing")
+    print(f"Time scale: [0, {args.time_scale}]")
     print("="*60)
     
-    for dataset in datasets:
+    for dataset in args.datasets:
         try:
-            normalize_timestamps(dataset)
+            normalize_timestamps(dataset, time_scale=args.time_scale)
         except Exception as e:
             print(f"Error processing {dataset}: {e}")
     

@@ -569,17 +569,22 @@ class GEPairREOptimizer(object):
                 # Amplitude decay regularization
                 l_amp = torch.zeros_like(l_reg)
                 if hasattr(self.model, 'time_encoder'):
-                    l_amp = self.amplitude_regularizer.forward(self.model.time_encoder.A)
+                    # For GlobalTemporalBasisEncoder: regularize W_r
+                    if hasattr(self.model.time_encoder, 'W_r'):
+                        l_amp = self.amplitude_regularizer.forward(self.model.time_encoder.W_r)
+                    # For old GaussianTemporalEncoder: regularize A
+                    elif hasattr(self.model.time_encoder, 'A'):
+                        l_amp = self.amplitude_regularizer.forward(self.model.time_encoder.A)
                 
                 # Width penalty regularization (upper bound)
                 l_width = torch.zeros_like(l_reg)
-                if hasattr(self.model, 'time_encoder'):
+                if hasattr(self.model, 'time_encoder') and hasattr(self.model.time_encoder, 'get_sigma'):
                     sigma = self.model.time_encoder.get_sigma()
                     l_width = self.width_regularizer.forward(sigma)
                 
                 # Sigma lower bound regularization (NEW!)
                 l_sigma_bound = torch.zeros_like(l_reg)
-                if hasattr(self.model, 'time_encoder'):
+                if hasattr(self.model, 'time_encoder') and hasattr(self.model.time_encoder, 'get_sigma'):
                     sigma = self.model.time_encoder.get_sigma()
                     l_sigma_bound = self.sigma_bound_regularizer.forward(sigma)
                 

@@ -400,22 +400,37 @@ class GEPairREOptimizer(object):
         # This allows optimizer to be recreated each epoch without breaking training
     
     def _freeze_gaussian_params(self):
-        """Freeze Gaussian parameters (A, mu, s, W_trend) during warm-up."""
+        """Freeze temporal parameters (W_r, V_base) during warm-up."""
         if hasattr(self.model, 'time_encoder'):
-            self.model.time_encoder.A.requires_grad = False
-            self.model.time_encoder.mu.requires_grad = False
-            self.model.time_encoder.s.requires_grad = False
-            # Also freeze global trend
+            # For GlobalTemporalBasisEncoder
+            if hasattr(self.model.time_encoder, 'W_r'):
+                self.model.time_encoder.W_r.requires_grad = False
+            if hasattr(self.model.time_encoder, 'V_base'):
+                self.model.time_encoder.V_base.requires_grad = False
+            
+            # For old GaussianTemporalEncoder (backward compatibility)
+            if hasattr(self.model.time_encoder, 'A'):
+                self.model.time_encoder.A.requires_grad = False
+            if hasattr(self.model.time_encoder, 'mu'):
+                self.model.time_encoder.mu.requires_grad = False
+            if hasattr(self.model.time_encoder, 's'):
+                self.model.time_encoder.s.requires_grad = False
             if hasattr(self.model.time_encoder, 'W_trend'):
                 self.model.time_encoder.W_trend.requires_grad = False
     
     def _unfreeze_gaussian_params(self):
-        """Unfreeze Gaussian parameters for dynamic training."""
+        """Unfreeze temporal parameters for dynamic training."""
         if hasattr(self.model, 'time_encoder'):
-            self.model.time_encoder.A.requires_grad = True
-            self.model.time_encoder.mu.requires_grad = True
-            self.model.time_encoder.s.requires_grad = True
-            # Also unfreeze global trend
+            # For GlobalTemporalBasisEncoder
+            if hasattr(self.model.time_encoder, 'W_r'):
+                self.model.time_encoder.W_r.requires_grad = True
+            if hasattr(self.model.time_encoder, 'V_base'):
+                self.model.time_encoder.V_base.requires_grad = True
+            
+            # For old GaussianTemporalEncoder (backward compatibility)
+            if hasattr(self.model.time_encoder, 'A'):
+                self.model.time_encoder.A.requires_grad = True
+            # Note: mu and s typically stay frozen in some configurations
             if hasattr(self.model.time_encoder, 'W_trend'):
                 self.model.time_encoder.W_trend.requires_grad = True
     

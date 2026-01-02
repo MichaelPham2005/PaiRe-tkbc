@@ -551,76 +551,104 @@ class RelationConditionedTimeEncoder(nn.Module):
         return m
 
 
-class DualComponentEncoder(nn.Module):
+class GlobalTemporalBasisEncoder(nn.Module):
     """
-    Dual-component temporal encoder with global trend + local pulses.
+    GE-PairRE v5: Global Temporal Basis with Shared Gaussian Kernels.
     
-    Formula:
-        Δe_r(τ) = W_trend,r · τ + Σ_k A_r,k · G_r,k(τ)
+    Architecture:
+        Δe_r(τ) = (W_r · B(τ)) ⊗ V_base,r
         
-    Where:
-        - W_trend,r: Global linear trend (learnable per relation)
-        - A_r,k: Amplitude of k-th Gaussian pulse
-        - G_r,k(τ): Gaussian activation centered at μ_r,k with width σ_r,k
+        Where:
+        - B(τ) ∈ R^K: K global Gaussian basis functions (SHARED across all relations)
+          B_k(τ) = exp(-(τ - μ_k)² / (2σ_k²))
+        - μ ∈ R^K: Global means (FIXED, evenly spaced in [0,1])
+        - σ ∈ R^K: Global sigmas (LARGE, e.g., 0.1 for overlap)
+        - W_r ∈ R^(N_r × K): Per-relation weights (LEARNABLE)
+        - V_base,r ∈ R^d: Per-relation characteristic vector (LEARNABLE)
     
-    This architecture enables better extrapolation by separating:
-    - Global trend: Long-term temporal patterns
-    - Local pulses: Specific event modeling
+    Key Differences from Dual-Component:
+    1. Gaussian kernels are SHARED globally (not per-relation)
+    2. Each relation learns HOW to combine these global patterns (W_r)
+    3. Reduces parameters: N_r×K instead of N_r×K×d
+    4. Better generalization: Forces relations to use common temporal structure
+    
+    Why This Fixes Overfitting:
+    - Global basis forces temporal patterns to be shared
+    - Model cannot memorize individual timestamps for each relation
+    - Must learn which global patterns are relevant for each relation
     """
     
     def __init__(self, n_relations: int, dim: int, K: int = 8, 
-                 sigma_min: float = 0.02, sigma_max: float = 0.3):
+                 sigma_init: float = 0.1, mu_fixed: bool = True):
         """
         Args:
             n_relations: Number of relations (includes inverse)
             dim: Embedding dimension
-            K: Number of Gaussian pulses per relation
-            sigma_min: Minimum width (e.g., 0.02 = 7 days in ICEWS14)
-            sigma_max: Maximum width (prevent flat Gaussians)
+            K: Number of global Gaussian kernels
+            sigma_init: Initial sigma (large for overlap, e.g., 0.1)
+            mu_fixed: If True, fix μ (recommended). If False, make learnable.
         """
-        super(DualComponentEncoder, self).__init__()
+        super(GlobalTemporalBasisEncoder, self).__init__()
         self.n_relations = n_relations
         self.dim = dim
         self.K = K
-        self.sigma_min = sigma_min
-        self.sigma_max = sigma_max
+        self.sigma_init = sigma_init
+        self.mu_fixed = mu_fixed
         self.eps = 1e-9
         
-        # GLOBAL TREND COMPONENT
-        # W_trend: (n_relations, dim) - per-relation linear evolution
-        self.W_trend = nn.Parameter(torch.randn(n_relations, dim) * 1e-4)
+        # === GLOBAL GAUSSIAN KERNELS (SHARED) ===
+        # Means: μ ∈ R^K, evenly spaced in [0,1]
+        mu_init = torch.linspace(0, 1, K)
+        if mu_fixed:
+            # Fixed means (recommended)
+            self.register_buffer('mu', mu_init)
+        else:
+            # Learnable means
+            self.mu = nn.Parameter(mu_init)
         
-        # LOCAL PULSE COMPONENT
-        # Amplitude: A_{r,k} ∈ R^d
-        self.A = nn.Parameter(torch.randn(n_relations, K, dim) * 1e-3)
+        # Sigmas: σ ∈ R^K, initialized large for overlap
+        sigma_tensor = torch.ones(K) * sigma_init
+        self.register_buffer('sigma', sigma_tensor)  # FIXED (not learnable)
         
-        # Mean: μ_{r,k} ∈ [0,1], evenly spaced
-        mu_init = torch.linspace(0, 1, K).unsqueeze(0).expand(n_relations, -1)
-        self.mu = nn.Parameter(mu_init)
+        # === RELATION-SPECIFIC WEIGHTS ===
+        # W_r: (n_relations, K) - how each relation uses global basis
+        # Initialize small to start from static embeddings
+        self.W_r = nn.Parameter(torch.randn(n_relations, K) * 1e-3)
         
-        # Log-scale: s_{r,k} controls σ = exp(s)
-        # Initialize to σ ≈ 0.1 (between sigma_min and sigma_max)
-        s_init = torch.ones(n_relations, K) * np.log(0.1)
-        self.s = nn.Parameter(s_init)
+        # V_base,r: (n_relations, dim) - characteristic direction per relation
+        # Initialize small to start from static embeddings
+        self.V_base = nn.Parameter(torch.randn(n_relations, dim) * 1e-3)
     
-    def get_sigma(self):
+    def compute_basis(self, tau: torch.Tensor):
         """
-        Compute width σ with bounds: σ_min ≤ σ ≤ σ_max
+        Compute global Gaussian basis B(τ) ∈ R^K.
         
-        Implementation:
-            σ = σ_min + (σ_max - σ_min) · sigmoid(s)
+        Args:
+            tau: (batch,) timestamps in [0,1]
+        
+        Returns:
+            B: (batch, K) basis activations
         """
-        # Sigmoid to [0, 1]
-        sigma_normalized = torch.sigmoid(self.s)
+        # tau: (batch,) -> (batch, 1)
+        # mu: (K,) -> (1, K)
+        # diff: (batch, K)
+        tau_expanded = tau.unsqueeze(1)  # (batch, 1)
+        mu_expanded = self.mu.unsqueeze(0)  # (1, K)
+        sigma_expanded = self.sigma.unsqueeze(0)  # (1, K)
         
-        # Map to [sigma_min, sigma_max]
-        sigma = self.sigma_min + (self.sigma_max - self.sigma_min) * sigma_normalized
+        diff = tau_expanded - mu_expanded  # (batch, K)
+        B = torch.exp(-diff ** 2 / (2 * sigma_expanded ** 2 + self.eps))  # (batch, K)
         
-        return sigma
+        return B
     
     def forward(self, rel_id: torch.Tensor, tau: torch.Tensor):
         """
-        Compute dual-component evolution vectors.
+        Compute evolution vector using global temporal basis.
+        
+        Formula:
+            Δe_r(τ) = (W_r · B(τ)) ⊗ V_base,r
+            
+        Where ⊗ means element-wise multiplication (broadcasting).
         
         Args:
             rel_id: (batch,) relation indices
@@ -631,25 +659,22 @@ class DualComponentEncoder(nn.Module):
         """
         batch_size = rel_id.shape[0]
         
-        # === GLOBAL TREND COMPONENT ===
-        W_trend = self.W_trend[rel_id]  # (batch, dim)
-        delta_trend = W_trend * tau.unsqueeze(1)  # (batch, dim)
+        # 1. Compute global basis B(τ): (batch, K)
+        B = self.compute_basis(tau)
         
-        # === LOCAL PULSE COMPONENT ===
-        A = self.A[rel_id]  # (batch, K, dim)
-        mu = self.mu[rel_id]  # (batch, K)
-        sigma = self.get_sigma()[rel_id]  # (batch, K)
+        # 2. Get relation-specific weights: (batch, K)
+        W_r = self.W_r[rel_id]  # (batch, K)
         
-        # Gaussian activations
-        tau_expanded = tau.unsqueeze(1)  # (batch, 1)
-        diff = tau_expanded - mu  # (batch, K)
-        G = torch.exp(-diff ** 2 / (2 * sigma ** 2 + self.eps))  # (batch, K)
+        # 3. Compute temporal weight: (batch,)
+        #    temporal_weight = Σ_k W_{r,k} · B_k(τ)
+        temporal_weight = torch.sum(W_r * B, dim=1)  # (batch,)
         
-        # Weighted sum of pulses
-        delta_pulses = torch.sum(A * G.unsqueeze(2), dim=1)  # (batch, dim)
+        # 4. Get characteristic vector: (batch, dim)
+        V_base = self.V_base[rel_id]  # (batch, dim)
         
-        # === TOTAL EVOLUTION ===
-        delta_e = delta_trend + delta_pulses
+        # 5. Compute evolution: (batch, dim)
+        #    Δe_r(τ) = temporal_weight ⊗ V_base,r
+        delta_e = temporal_weight.unsqueeze(1) * V_base  # (batch, dim)
         
         return delta_e
     
@@ -775,13 +800,13 @@ class GEPairRE(TKBCModel):
     """
     def __init__(self, sizes: Tuple[int, int, int, int], rank: int, 
                  init_size: float = 1e-3, K: int = 8, 
-                 sigma_min: float = 0.02, sigma_max: float = 0.3):
+                 sigma_init: float = 0.1, mu_fixed: bool = True):
         super(GEPairRE, self).__init__()
         self.sizes = sizes
         self.rank = rank
         self.K = K
-        self.sigma_min = sigma_min
-        self.sigma_max = sigma_max
+        self.sigma_init = sigma_init
+        self.mu_fixed = mu_fixed
         
         # Static embeddings
         self.entity_embeddings = nn.Embedding(sizes[0], rank, sparse=True)
@@ -796,13 +821,13 @@ class GEPairRE(TKBCModel):
         self.relation_head.weight.data *= init_size
         self.relation_tail.weight.data *= init_size
         
-        # Dual-component temporal encoder (UPDATED!)
-        self.time_encoder = DualComponentEncoder(
+        # Global Temporal Basis encoder (v5)
+        self.time_encoder = GlobalTemporalBasisEncoder(
             n_relations=sizes[1], 
             dim=rank, 
             K=K,
-            sigma_min=sigma_min,
-            sigma_max=sigma_max
+            sigma_init=sigma_init,
+            mu_fixed=mu_fixed
         )
     
     @staticmethod

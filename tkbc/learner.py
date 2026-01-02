@@ -95,35 +95,27 @@ parser.add_argument(
 # GE-PairRE specific arguments
 parser.add_argument(
     '--K_gaussians', default=8, type=int,
-    help="Number of Gaussian pulses per relation (GEPairRE only)"
+    help="Number of global Gaussian kernels (GEPairRE only)"
 )
 parser.add_argument(
-    '--sigma_min', default=0.02, type=float,
-    help="Minimum width for Gaussian pulses (GEPairRE only, ~7 days for ICEWS14)"
+    '--sigma_init', default=0.1, type=float,
+    help="Initial sigma for global Gaussian kernels (GEPairRE only, large for overlap)"
 )
 parser.add_argument(
-    '--sigma_max', default=0.3, type=float,
-    help="Maximum width for Gaussian pulses (GEPairRE only)"
+    '--mu_fixed', default=True, type=lambda x: x.lower() in ['true', '1', 'yes'],
+    help="Fix mu (means) of global Gaussians (GEPairRE only, recommended)"
 )
 parser.add_argument(
     '--warmup_epochs', default=5, type=int,
-    help="Number of warm-up epochs to freeze Gaussian params (GEPairRE only)"
+    help="Number of warm-up epochs to freeze temporal params (GEPairRE only)"
 )
 parser.add_argument(
     '--amplitude_reg', default=0.001, type=float,
-    help="Amplitude decay regularization weight (GEPairRE only)"
+    help="Weight decay on W_r (relation-specific weights) (GEPairRE only)"
 )
 parser.add_argument(
     '--smoothness_reg', default=0.01, type=float,
     help="Temporal smoothness regularization weight (GEPairRE only)"
-)
-parser.add_argument(
-    '--sigma_bound_reg', default=0.1, type=float,
-    help="Sigma lower bound regularization weight (GEPairRE only)"
-)
-parser.add_argument(
-    '--width_reg', default=0.01, type=float,
-    help="Width penalty regularization weight (GEPairRE only)"
 )
 parser.add_argument(
     '--max_lambda_time', default=1.0, type=float,
@@ -144,7 +136,7 @@ model = {
     'TNTComplEx': TNTComplEx(sizes, args.rank, no_time_emb=args.no_time_emb),
     'ContinuousPairRE': ContinuousPairRE(sizes, args.rank, K=args.K_frequencies, beta=args.beta),
     'GEPairRE': GEPairRE(sizes, args.rank, K=args.K_gaussians, 
-                         sigma_min=args.sigma_min, sigma_max=args.sigma_max),
+                         sigma_init=args.sigma_init, mu_fixed=args.mu_fixed),
 }[args.model]
 model = model.cuda()
 
@@ -187,14 +179,12 @@ if args.model == 'ContinuousPairRE':
     print(f"Time discrimination weight: {args.time_discrimination_weight}")
     print(f"Time scale: [0, {args.time_scale}]")
 elif args.model == 'GEPairRE':
-    print(f"K Gaussians: {args.K_gaussians}")
-    print(f"Sigma min: {args.sigma_min}")
-    print(f"Sigma max: {args.sigma_max}")
+    print(f"K Global Gaussians: {args.K_gaussians}")
+    print(f"Sigma init: {args.sigma_init}")
+    print(f"Mu fixed: {args.mu_fixed}")
     print(f"Warmup epochs: {args.warmup_epochs}")
     print(f"Amplitude regularization: {args.amplitude_reg}")
-    print(f"Width regularization: {args.width_reg}")
     print(f"Smoothness regularization: {args.smoothness_reg}")
-    print(f"Sigma bound regularization: {args.sigma_bound_reg}")
     print(f"Max λ_time: {args.max_lambda_time}")
     print(f"Margin (hard temporal discrimination): {args.margin}")
 print(f"Checkpoint directory: {checkpoint_dir}")
@@ -209,18 +199,17 @@ time_reg = ContinuousTimeLambda3(args.time_reg) if args.model == 'ContinuousPair
 from regularizers import TimeParameterRegularizer
 time_param_reg = TimeParameterRegularizer(args.time_param_reg) if args.model == 'ContinuousPairRE' else None
 
-# GE-PairRE specific regularizers
+# GE-PairRE specific regularizers (for GlobalTemporalBasisEncoder)
+# Note: AmplitudeDecayRegularizer now applies to W_r weights
 amplitude_reg = AmplitudeDecayRegularizer(args.amplitude_reg) if args.model == 'GEPairRE' else None
-width_reg = WidthPenaltyRegularizer(args.width_reg, args.sigma_max) if args.model == 'GEPairRE' else None
-# NEW: Dual-component regularizers
+# Note: width_reg and sigma_bound_reg not used in GlobalTemporalBasisEncoder (sigma is fixed)
+width_reg = None
+# NEW: Temporal smoothness regularizer
 smoothness_reg = TemporalSmoothnessRegularizer(
     weight=args.smoothness_reg if hasattr(args, 'smoothness_reg') else 0.01,
     epsilon=0.01  # ~3.6 days for ICEWS14
 ) if args.model == 'GEPairRE' else None
-sigma_bound_reg = SigmaLowerBoundRegularizer(
-    weight=args.sigma_bound_reg if hasattr(args, 'sigma_bound_reg') else 0.1,
-    sigma_min=args.sigma_min if hasattr(args, 'sigma_min') else 0.02
-) if args.model == 'GEPairRE' else None
+sigma_bound_reg = None  # Not needed for fixed sigma
 
 # Track best validation MRR for saving best model
 best_valid_mrr = 0.0
